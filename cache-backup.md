@@ -7,6 +7,20 @@
 - B300 只负责生成缓存并 commit 到 Volume，不等待 GitHub 上传。
 - GitHub 上传由主 App `glm53-flash-nota-b300` 内的独立 CPU function 完成。
 - CPU cache worker 与 B300 serving 属于同一个 Modal App，因此 deploy / stop 生命周期一致。
+- 所有持久缓存统一收口到一个项目 Volume：`modal-GLM-5.3-Flash-Nota-NVFP4`。
+
+## Volume 布局
+
+```text
+modal-GLM-5.3-Flash-Nota-NVFP4
+├── glm53-flash-nota-hf-cache/
+├── glm53-flash-nota-cuda-compute-cache/
+├── glm53-flash-nota-flashinfer-autotune/
+├── glm53-flash-nota-torchinductor-cache/
+├── glm53-flash-nota-flashinfer-jit/
+├── glm53-flash-nota-triton-cache/
+└── glm53-flash-nota-tilelang-cache/
+```
 
 ## 运行链路
 
@@ -26,7 +40,7 @@ glm53-flash-nota-b300 / backup_runtime_caches
   -> 清理 dirty marker
 ```
 
-独立 backup app 每小时还会自动检查一次，因此即使 B300 在 Volume commit 后、spawn 前被强制停止，dirty marker 仍会被后续 CPU 任务发现。
+同一 App 内的 scheduled CPU backup function 每小时还会自动检查一次，因此即使 B300 在 Volume commit 后、spawn 前被强制停止，dirty marker 仍会被后续 CPU 任务发现。
 
 ## GitHub Release
 

@@ -72,24 +72,25 @@ REVISION = "c5fc7f5ef0447ab030559bb4b08861a36dbbe847"
 MODEL_RUNTIME_PATH = "/tmp/glm53-model"
 RUNTIME_IMAGE = "vllm/vllm-openai:glm53-flash"
 
-HF_CACHE = "/root/.cache/huggingface"
-HF_VOLUME_NAME = "glm53-flash-nota-hf-cache"
-FLASHINFER_AUTOTUNE_CACHE = "/root/.cache/vllm/flashinfer_autotune_cache"
-FLASHINFER_AUTOTUNE_VOLUME_NAME = "glm53-flash-nota-flashinfer-autotune"
-FLASHINFER_JIT_CACHE = "/root/.cache/flashinfer"
-FLASHINFER_JIT_VOLUME_NAME = "glm53-flash-nota-flashinfer-jit"
-TILELANG_CACHE = "/root/.tilelang/cache"
-TILELANG_VOLUME_NAME = "glm53-flash-nota-tilelang-cache"
+PROJECT_VOLUME_NAME = "modal-GLM-5.3-Flash-Nota-NVFP4"
+PROJECT_VOLUME_ROOT = "/project-volume"
+HF_CACHE = f"{PROJECT_VOLUME_ROOT}/glm53-flash-nota-hf-cache"
+FLASHINFER_AUTOTUNE_CACHE = (
+    f"{PROJECT_VOLUME_ROOT}/glm53-flash-nota-flashinfer-autotune"
+)
+FLASHINFER_JIT_CACHE = f"{PROJECT_VOLUME_ROOT}/glm53-flash-nota-flashinfer-jit"
+TILELANG_CACHE = f"{PROJECT_VOLUME_ROOT}/glm53-flash-nota-tilelang-cache"
 STAGED_CACHE_ROOT = "/tmp/glm53-runtime-cache"
 TRITON_CACHE = f"{STAGED_CACHE_ROOT}/triton"
-TRITON_CACHE_SEED = "/cache-seeds/triton"
-TRITON_VOLUME_NAME = "glm53-flash-nota-triton-cache"
+TRITON_CACHE_SEED = f"{PROJECT_VOLUME_ROOT}/glm53-flash-nota-triton-cache"
 TORCHINDUCTOR_CACHE = f"{STAGED_CACHE_ROOT}/torchinductor"
-TORCHINDUCTOR_CACHE_SEED = "/cache-seeds/torchinductor"
-TORCHINDUCTOR_VOLUME_NAME = "glm53-flash-nota-torchinductor-cache"
+TORCHINDUCTOR_CACHE_SEED = (
+    f"{PROJECT_VOLUME_ROOT}/glm53-flash-nota-torchinductor-cache"
+)
 CUDA_COMPUTE_CACHE = f"{STAGED_CACHE_ROOT}/cuda-compute"
-CUDA_COMPUTE_CACHE_SEED = "/cache-seeds/cuda-compute"
-CUDA_COMPUTE_VOLUME_NAME = "glm53-flash-nota-cuda-compute-cache"
+CUDA_COMPUTE_CACHE_SEED = (
+    f"{PROJECT_VOLUME_ROOT}/glm53-flash-nota-cuda-compute-cache"
+)
 
 GITHUB_REPO = "xiaoqianran/modal-GLM-5.3-Flash-Nota-NVFP4"
 CACHE_RELEASE_TAG = "cache-b300-glm53-flash-nota-v1"
@@ -97,21 +98,21 @@ RUNTIME_CACHE_ARTIFACTS = (
     CacheArtifact(
         name="flashinfer-autotune",
         local_path=FLASHINFER_AUTOTUNE_CACHE,
-        volume_name=FLASHINFER_AUTOTUNE_VOLUME_NAME,
+        volume_name=PROJECT_VOLUME_NAME,
         release_asset="flashinfer-autotune-0.6.18-b300.tar.gz",
         required_globs=("**/autotune_configs.json",),
     ),
     CacheArtifact(
         name="flashinfer-jit",
         local_path=FLASHINFER_JIT_CACHE,
-        volume_name=FLASHINFER_JIT_VOLUME_NAME,
+        volume_name=PROJECT_VOLUME_NAME,
         release_asset="flashinfer-jit-0.6.18-b300.tar.gz",
         required_globs=("**/*.so", "**/*.o", "**/*.cubin"),
     ),
     CacheArtifact(
         name="tilelang",
         local_path=TILELANG_CACHE,
-        volume_name=TILELANG_VOLUME_NAME,
+        volume_name=PROJECT_VOLUME_NAME,
         release_asset="tilelang-b300.tar.gz",
         required_globs=("**/*.so", "**/*.cubin", "**/best_config.json"),
     ),
@@ -121,21 +122,21 @@ STAGED_CACHE_ARTIFACTS = (
     CacheArtifact(
         name="triton",
         local_path=TRITON_CACHE_SEED,
-        volume_name=TRITON_VOLUME_NAME,
+        volume_name=PROJECT_VOLUME_NAME,
         release_asset="triton-b300.tar.gz",
         required_globs=(".stage-cache.tar",),
     ),
     CacheArtifact(
         name="torchinductor",
         local_path=TORCHINDUCTOR_CACHE_SEED,
-        volume_name=TORCHINDUCTOR_VOLUME_NAME,
+        volume_name=PROJECT_VOLUME_NAME,
         release_asset="torchinductor-b300.tar.gz",
         required_globs=(".stage-cache.tar",),
     ),
     CacheArtifact(
         name="cuda-compute",
         local_path=CUDA_COMPUTE_CACHE_SEED,
-        volume_name=CUDA_COMPUTE_VOLUME_NAME,
+        volume_name=PROJECT_VOLUME_NAME,
         release_asset="cuda-compute-b300.tar.gz",
         required_globs=("cuda-compute-b300.tar",),
     ),
@@ -231,18 +232,11 @@ def _validate_production_serving_profile() -> str:
 PRODUCTION_SERVING_PROFILE_FINGERPRINT = _validate_production_serving_profile()
 
 
-volume = modal.Volume.from_name(HF_VOLUME_NAME, create_if_missing=True)
-cache_volumes = {
-    artifact.name: modal.Volume.from_name(
-        artifact.volume_name,
-        create_if_missing=True,
-    )
-    for artifact in ALL_CACHE_ARTIFACTS
-}
-cache_mounts = {
-    artifact.local_path: cache_volumes[artifact.name]
-    for artifact in ALL_CACHE_ARTIFACTS
-}
+project_volume = modal.Volume.from_name(
+    PROJECT_VOLUME_NAME,
+    create_if_missing=True,
+)
+project_mount = {PROJECT_VOLUME_ROOT: project_volume}
 hf_secret = modal.Secret.from_name("huggingface")
 github_secret = modal.Secret.from_name("github")
 
@@ -298,11 +292,11 @@ app = modal.App(APP_NAME)
     memory=65536,
     timeout=14400,
     secrets=[hf_secret],
-    volumes={HF_CACHE: volume},
+    volumes=project_mount,
 )
 def step_001_download():
     """下载并缓存固定 revision 的模型权重；已完整缓存时直接返回。"""
-    step_001_download_model(MODEL, REVISION, volume)
+    step_001_download_model(MODEL, REVISION, project_volume)
 
 
 def _restore_cache_artifacts(artifacts) -> dict[str, str]:
@@ -315,7 +309,7 @@ def _restore_cache_artifacts(artifacts) -> dict[str, str]:
         )
         results[artifact.name] = source
         if source == "github":
-            cache_volumes[artifact.name].commit()
+            project_volume.commit()
             print(
                 f"[009_CACHE_MODAL_COMMIT] name={artifact.name} source=github",
                 flush=True,
@@ -397,7 +391,7 @@ def _backup_runtime_caches(
             step_012_clear_dirty(artifact.local_path)
             marker_cleared = True
         if marker_cleared:
-            cache_volumes[artifact.name].commit()
+            project_volume.commit()
     return results
 
 
@@ -407,7 +401,7 @@ def _backup_runtime_caches(
     memory=1024,
     timeout=900,
     secrets=[github_secret],
-    volumes=cache_mounts,
+    volumes=project_mount,
 )
 def step_009_restore_runtime_caches():
     """CPU 阶段：Volume 优先，缺失时从 GitHub Release 恢复运行时缓存。"""
@@ -422,7 +416,7 @@ def step_009_restore_runtime_caches():
     max_containers=1,
     scaledown_window=60,
     secrets=[github_secret],
-    volumes=cache_mounts,
+    volumes=project_mount,
     schedule=modal.Period(hours=1),
 )
 def backup_runtime_caches(
@@ -445,7 +439,7 @@ def backup_runtime_caches(
     max_containers=1,
     scaledown_window=60,
     secrets=[github_secret],
-    volumes=cache_mounts,
+    volumes=project_mount,
 )
 def backup_all_force():
     """部署阶段使用：强制刷新全部已就绪 cache 到 GitHub Release。"""
@@ -457,7 +451,7 @@ def backup_all_force():
     cpu=2,
     memory=4096,
     timeout=1800,
-    volumes=cache_mounts,
+    volumes=project_mount,
 )
 def step_013_compact_staged_archives():
     """CPU 一次性迁移：把 Triton/Inductor/CUDA 多文件 seed 收口为单归档。"""
@@ -471,7 +465,7 @@ def step_013_compact_staged_archives():
             archive_name=STAGED_CACHE_ARCHIVE_NAMES[artifact.name],
         )
         results[artifact.name] = changed
-        cache_volumes[artifact.name].commit()
+        project_volume.commit()
     return results
 
 
@@ -485,7 +479,7 @@ def step_013_compact_staged_archives():
     min_containers=0,
     max_containers=1,
     buffer_containers=0,
-    volumes={HF_CACHE: volume},
+    volumes=project_mount,
 )
 def step_002_bench_weights(
     strategy: str = "prefetch",
@@ -664,7 +658,7 @@ def _sync_runtime_caches(
         if changed:
             mark_cache_backup_dirty(artifact.local_path)
 
-        cache_volumes[artifact.name].commit()
+        project_volume.commit()
         print(
             f"[RUNTIME_CACHE_COMMIT] name={artifact.name} path={artifact.local_path}",
             flush=True,
@@ -693,7 +687,7 @@ def _sync_runtime_caches(
                 flush=True,
             )
 
-        cache_volumes[artifact.name].commit()
+        project_volume.commit()
         print(
             f"[RUNTIME_CACHE_COMMIT] name={artifact.name} path={artifact.local_path}",
             flush=True,
@@ -718,7 +712,7 @@ def _sync_runtime_caches(
     min_containers=0,
     max_containers=MAX_B300_CONTAINERS,
     buffer_containers=0,
-    volumes={HF_CACHE: volume, **cache_mounts},
+    volumes=project_mount,
     secrets=[github_secret],
     enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},
