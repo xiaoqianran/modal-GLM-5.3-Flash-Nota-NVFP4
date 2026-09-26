@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -62,23 +63,24 @@ def _cache_ready(artifact: CacheArtifact) -> bool:
     return _path_has_required(Path(artifact.local_path), artifact.required_globs)
 
 
-def cache_fingerprint(artifact: CacheArtifact) -> tuple[tuple[str, int, int], ...]:
-    """Return a cheap metadata fingerprint for cache artifacts matched by required_globs."""
+def cache_fingerprint(artifact: CacheArtifact) -> tuple[tuple[str, int, str], ...]:
+    """Return a content fingerprint so mtime-only rewrites do not republish assets."""
     root = Path(artifact.local_path)
     if not root.exists():
         return ()
 
-    records: dict[str, tuple[str, int, int]] = {}
+    records: dict[str, tuple[str, int, str]] = {}
     for pattern in artifact.required_globs:
         for path in root.glob(pattern):
             if not path.is_file():
                 continue
             try:
-                stat = path.stat()
+                size = path.stat().st_size
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
             except OSError:
                 continue
             rel = path.relative_to(root).as_posix()
-            records[rel] = (rel, stat.st_size, stat.st_mtime_ns)
+            records[rel] = (rel, size, digest)
     return tuple(records[key] for key in sorted(records))
 
 

@@ -38,6 +38,9 @@ step_010_publish_cache = importlib.import_module(
 step_011_discover_runtime_caches = importlib.import_module(
     "helpers.011_cache_discovery"
 ).step_011_discover_runtime_caches
+cache_staging_module = importlib.import_module("helpers.012_cache_staging")
+step_012_stage_cache = cache_staging_module.step_012_stage_cache
+step_012_sync_cache = cache_staging_module.step_012_sync_cache
 
 
 APP_NAME = os.getenv("GLM53_APP_NAME", "glm53-flash-nota-b300")
@@ -52,6 +55,9 @@ FLASHINFER_JIT_CACHE = "/root/.cache/flashinfer"
 FLASHINFER_JIT_VOLUME_NAME = "glm53-flash-nota-flashinfer-jit"
 TILELANG_CACHE = "/root/.tilelang/cache"
 TILELANG_VOLUME_NAME = "glm53-flash-nota-tilelang-cache"
+TRITON_CACHE = "/root/.triton/cache"
+TRITON_CACHE_SEED = "/cache-seeds/triton"
+TRITON_VOLUME_NAME = "glm53-flash-nota-triton-cache"
 
 GITHUB_REPO = "xiaoqianran/modal-GLM-5.3-Flash-Nota-NVFP4"
 CACHE_RELEASE_TAG = "cache-b300-glm53-flash-nota-v1"
@@ -79,6 +85,17 @@ RUNTIME_CACHE_ARTIFACTS = (
     ),
 )
 
+STAGED_CACHE_ARTIFACTS = (
+    CacheArtifact(
+        name="triton",
+        local_path=TRITON_CACHE_SEED,
+        volume_name=TRITON_VOLUME_NAME,
+        release_asset="triton-b300.tar.gz",
+        required_globs=("**/*.autotune.json", "**/*.cubin", "**/*.so", "**/*.json"),
+    ),
+)
+ALL_CACHE_ARTIFACTS = RUNTIME_CACHE_ARTIFACTS + STAGED_CACHE_ARTIFACTS
+
 MAX_B300_CONTAINERS = 1
 MAX_CONCURRENT_INPUTS = 16
 SCALEDOWN_WINDOW_SECONDS = 1800
@@ -97,16 +114,16 @@ if PREFETCH_BLOCK_MIB < 1:
 
 
 volume = modal.Volume.from_name(HF_VOLUME_NAME, create_if_missing=True)
-runtime_cache_volumes = {
+cache_volumes = {
     artifact.name: modal.Volume.from_name(
         artifact.volume_name,
         create_if_missing=True,
     )
-    for artifact in RUNTIME_CACHE_ARTIFACTS
+    for artifact in ALL_CACHE_ARTIFACTS
 }
-runtime_cache_mounts = {
-    artifact.local_path: runtime_cache_volumes[artifact.name]
-    for artifact in RUNTIME_CACHE_ARTIFACTS
+cache_mounts = {
+    artifact.local_path: cache_volumes[artifact.name]
+    for artifact in ALL_CACHE_ARTIFACTS
 }
 hf_secret = modal.Secret.from_name("huggingface")
 github_secret = modal.Secret.from_name("github")
@@ -143,6 +160,8 @@ runtime_image = (
             "GLM53_PREFETCH_THREADS": str(PREFETCH_THREADS),
             "GLM53_PREFETCH_BLOCK_MIB": str(PREFETCH_BLOCK_MIB),
             "TILELANG_CACHE_DIR": TILELANG_CACHE,
+            "TRITON_CACHE_DIR": TRITON_CACHE,
+            "TRITON_CACHE_AUTOTUNING": "1",
         }
     )
     .add_local_dir("helpers", "/root/helpers")
@@ -166,7 +185,7 @@ def step_001_download():
 
 def _restore_runtime_caches() -> dict[str, str]:
     results: dict[str, str] = {}
-    for artifact in RUNTIME_CACHE_ARTIFACTS:
+    for artifact in ALL_CACHE_ARTIFACTS:
         source = step_009_restore_cache(
             artifact,
             github_repo=GITHUB_REPO,
@@ -174,7 +193,7 @@ def _restore_runtime_caches() -> dict[str, str]:
         )
         results[artifact.name] = source
         if source == "github":
-            runtime_cache_volumes[artifact.name].commit()
+            cache_volumes[artifact.name].commit()
             print(
                 f"[009_CACHE_MODAL_COMMIT] name={artifact.name} source=github",
                 flush=True,
@@ -184,7 +203,7 @@ def _restore_runtime_caches() -> dict[str, str]:
 
 def _publish_runtime_caches() -> dict[str, bool]:
     results: dict[str, bool] = {}
-    for artifact in RUNTIME_CACHE_ARTIFACTS:
+    for artifact in ALL_CACHE_ARTIFACTS:
         results[artifact.name] = step_010_publish_cache(
             artifact,
             github_repo=GITHUB_REPO,
@@ -199,7 +218,7 @@ def _publish_runtime_caches() -> dict[str, bool]:
     memory=1024,
     timeout=900,
     secrets=[github_secret],
-    volumes=runtime_cache_mounts,
+    volumes=cache_mounts,
 )
 def step_009_restore_runtime_caches():
     """CPU 阶段：Volume 优先，缺失时从 GitHub Release 恢复运行时缓存。"""
@@ -212,7 +231,7 @@ def step_009_restore_runtime_caches():
     memory=1024,
     timeout=900,
     secrets=[github_secret],
-    volumes=runtime_cache_mounts,
+    volumes=cache_mounts,
 )
 def step_010_publish_runtime_caches():
     """CPU 阶段：确保当前可移植缓存已有 GitHub Release 备份。"""
@@ -256,7 +275,7 @@ def step_002_bench_weights(
     min_containers=0,
     max_containers=MAX_B300_CONTAINERS,
     buffer_containers=0,
-    volumes={HF_CACHE: volume, **runtime_cache_mounts},
+    volumes={HF_CACHE: volume, **cache_mounts},
     secrets=[github_secret],
 )
 @modal.concurrent(max_inputs=MAX_CONCURRENT_INPUTS)
@@ -266,8 +285,13 @@ def serve():
     cache_sources = _restore_runtime_caches()
     cache_fingerprints_before = {
         artifact.name: cache_fingerprint(artifact)
-        for artifact in RUNTIME_CACHE_ARTIFACTS
+        for artifact in ALL_CACHE_ARTIFACTS
     }
+    step_012_stage_cache(
+        TRITON_CACHE_SEED,
+        TRITON_CACHE,
+        name="triton",
+    )
 
     strategy = os.environ.get(
         "GLM53_LOAD_STRATEGY",
@@ -348,9 +372,14 @@ def serve():
             process_started_at=vllm_handle.started_at,
             api_ready_at=api_ready_at,
         )
+        step_012_sync_cache(
+            TRITON_CACHE,
+            TRITON_CACHE_SEED,
+            name="triton",
+        )
 
-        for artifact in RUNTIME_CACHE_ARTIFACTS:
-            runtime_cache_volumes[artifact.name].commit()
+        for artifact in ALL_CACHE_ARTIFACTS:
+            cache_volumes[artifact.name].commit()
             print(
                 f"[RUNTIME_CACHE_COMMIT] name={artifact.name} path={artifact.local_path}",
                 flush=True,
