@@ -276,6 +276,7 @@ runtime_image = (
             "CUDA_VISIBLE_DEVICES": "0",
             "HF_HOME": HF_CACHE,
             "HF_HUB_OFFLINE": "1",
+            "VLLM_SERVER_DEV_MODE": "0",
             "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": FLASHINFER_AUTOTUNE_RUNTIME_CACHE,
             "FLASHINFER_WORKSPACE_BASE": FLASHINFER_WORKSPACE_BASE,
             "TORCHINDUCTOR_COMPILE_THREADS": "1",
@@ -609,6 +610,16 @@ def _build_vllm_command(model_path: str) -> list[str]:
             "--safetensors-prefetch-block-size",
             str(prefetch_block_mib * 1024 * 1024),
         ]
+
+    if "--enable-sleep-mode" in command:
+        raise RuntimeError(
+            "Production serving must not enable vLLM sleep mode"
+        )
+    print(
+        "[SLEEP_MODE_DISABLED] "
+        "enable_sleep_mode=False VLLM_SERVER_DEV_MODE=0",
+        flush=True,
+    )
 
     print(
         "[MODEL_LOAD] "
