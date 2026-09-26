@@ -2,6 +2,7 @@ import hashlib
 import importlib
 import json
 import os
+import threading
 import time
 
 import modal
@@ -79,7 +80,10 @@ FLASHINFER_AUTOTUNE_RUNTIME_CACHE = (
     f"{FLASHINFER_AUTOTUNE_CACHE}/"
     f"{FLASHINFER_AUTOTUNE_VERSION}/{FLASHINFER_AUTOTUNE_ARCH}"
 )
-FLASHINFER_JIT_CACHE = f"{PROJECT_VOLUME_ROOT}/glm53-flash-nota-flashinfer-jit"
+FLASHINFER_WORKSPACE_BASE = (
+    f"{PROJECT_VOLUME_ROOT}/glm53-flash-nota-flashinfer-jit-workspace"
+)
+FLASHINFER_JIT_CACHE = f"{FLASHINFER_WORKSPACE_BASE}/.cache/flashinfer"
 TILELANG_CACHE = f"{PROJECT_VOLUME_ROOT}/glm53-flash-nota-tilelang-cache"
 STAGED_CACHE_ROOT = "/tmp/glm53-runtime-cache"
 TRITON_CACHE = f"{STAGED_CACHE_ROOT}/triton"
@@ -270,6 +274,7 @@ runtime_image = (
             "HF_HUB_OFFLINE": "1",
             "VLLM_SERVER_DEV_MODE": "1",
             "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": FLASHINFER_AUTOTUNE_RUNTIME_CACHE,
+            "FLASHINFER_WORKSPACE_BASE": FLASHINFER_WORKSPACE_BASE,
             "TORCHINDUCTOR_COMPILE_THREADS": "1",
             "GLM53_LOAD_STRATEGY": LOAD_STRATEGY,
             "GLM53_PREFETCH_THREADS": str(PREFETCH_THREADS),
@@ -691,6 +696,43 @@ def _sync_runtime_caches(
         print("[CACHE_BACKUP_SKIP] reason=no_runtime_cache_changes", flush=True)
 
 
+def _start_runtime_cache_sync(
+    cache_sources: dict[str, str],
+    cache_fingerprints_before: dict[str, tuple],
+) -> threading.Thread:
+    """API Ready 后后台持久化 cache，不阻塞对外服务。"""
+
+    def run() -> None:
+        started_at = time.perf_counter()
+        print("[CACHE_SYNC_BACKGROUND_START]", flush=True)
+        try:
+            _sync_runtime_caches(
+                cache_sources,
+                cache_fingerprints_before,
+            )
+        except Exception as exc:
+            print(
+                "[CACHE_SYNC_BACKGROUND_FAILED] "
+                f"error={type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            return
+
+        print(
+            "[CACHE_SYNC_BACKGROUND_DONE] "
+            f"elapsed_s={time.perf_counter() - started_at:.3f}",
+            flush=True,
+        )
+
+    thread = threading.Thread(
+        target=run,
+        name="runtime-cache-sync",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
 @app.cls(
     image=runtime_image,
     gpu="B300",
@@ -761,7 +803,7 @@ class VllmServer:
             api_ready_at=api_ready_at,
             repeats=3,
         )
-        _sync_runtime_caches(
+        self.cache_sync_thread = _start_runtime_cache_sync(
             cache_sources,
             cache_fingerprints_before,
         )
@@ -782,6 +824,15 @@ class VllmServer:
     @modal.exit()
     def shutdown(self) -> None:
         """容器退出时回收 vLLM 子进程。"""
+        cache_sync_thread = getattr(self, "cache_sync_thread", None)
+        if cache_sync_thread is not None and cache_sync_thread.is_alive():
+            cache_sync_thread.join(timeout=30)
+            if cache_sync_thread.is_alive():
+                print(
+                    "[CACHE_SYNC_BACKGROUND_EXIT_TIMEOUT] timeout_s=30",
+                    flush=True,
+                )
+
         handle = getattr(self, "vllm_handle", None)
         if handle is None:
             return
