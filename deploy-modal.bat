@@ -15,22 +15,30 @@ set "GH_SECRET_FILE=%TEMP%\glm53-gh-%RANDOM%-%RANDOM%.env"
 findstr /b "HF_TOKEN=" ".env" > "%HF_SECRET_FILE%"
 findstr /b "GITHUB_TOKEN=" ".env" > "%GH_SECRET_FILE%"
 
-echo [1/4] Sync Hugging Face secret...
+echo [1/6] Sync Hugging Face secret...
 uv run modal secret create --from-dotenv "%HF_SECRET_FILE%" --force huggingface || goto :failed
 
 echo.
-echo [2/4] Sync GitHub secret...
+echo [2/6] Sync GitHub secret...
 uv run modal secret create --from-dotenv "%GH_SECRET_FILE%" --force github || goto :failed
 
 del /q "%HF_SECRET_FILE%" 2>nul
 del /q "%GH_SECRET_FILE%" 2>nul
 
 echo.
-echo [3/4] Ensure model is cached in Modal Volume...
+echo [3/6] Ensure model is cached in Modal Volume...
 uv run modal run app.py::step_001_download || goto :failed
 
 echo.
-echo [4/4] Deploy single-B300 service...
+echo [4/6] Restore runtime caches: Modal Volume first, GitHub Release fallback...
+uv run modal run app.py::step_009_restore_runtime_caches || echo [WARN] Runtime cache restore failed; GPU startup will regenerate missing cache.
+
+echo.
+echo [5/6] Ensure runtime caches are backed up to GitHub Release...
+uv run modal run app.py::step_010_publish_runtime_caches || echo [WARN] GitHub cache backup failed; deployment will continue.
+
+echo.
+echo [6/6] Deploy single-B300 service...
 uv run modal deploy app.py || goto :failed
 
 echo.

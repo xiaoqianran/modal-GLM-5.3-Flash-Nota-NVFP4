@@ -28,6 +28,12 @@ step_007_start_api_ready_observer = importlib.import_module(
 step_008_run_warmup = importlib.import_module(
     "helpers.008_warmup"
 ).step_008_run_warmup
+cache_restore_module = importlib.import_module("helpers.009_cache_restore")
+CacheArtifact = cache_restore_module.CacheArtifact
+step_009_restore_cache = cache_restore_module.step_009_restore_cache
+step_010_publish_cache = importlib.import_module(
+    "helpers.010_cache_publish"
+).step_010_publish_cache
 
 
 APP_NAME = os.getenv("GLM53_APP_NAME", "glm53-flash-nota-b300")
@@ -38,6 +44,18 @@ HF_CACHE = "/root/.cache/huggingface"
 HF_VOLUME_NAME = "glm53-flash-nota-hf-cache"
 FLASHINFER_AUTOTUNE_CACHE = "/root/.cache/vllm/flashinfer_autotune_cache"
 FLASHINFER_AUTOTUNE_VOLUME_NAME = "glm53-flash-nota-flashinfer-autotune"
+
+GITHUB_REPO = "xiaoqianran/modal-GLM-5.3-Flash-Nota-NVFP4"
+CACHE_RELEASE_TAG = "cache-b300-glm53-flash-nota-v1"
+RUNTIME_CACHE_ARTIFACTS = (
+    CacheArtifact(
+        name="flashinfer-autotune",
+        local_path=FLASHINFER_AUTOTUNE_CACHE,
+        volume_name=FLASHINFER_AUTOTUNE_VOLUME_NAME,
+        release_asset="flashinfer-autotune-0.6.18-b300.tar.gz",
+        required_glob="**/autotune_configs.json",
+    ),
+)
 
 MAX_B300_CONTAINERS = 1
 MAX_CONCURRENT_INPUTS = 16
@@ -57,11 +75,19 @@ if PREFETCH_BLOCK_MIB < 1:
 
 
 volume = modal.Volume.from_name(HF_VOLUME_NAME, create_if_missing=True)
-flashinfer_autotune_volume = modal.Volume.from_name(
-    FLASHINFER_AUTOTUNE_VOLUME_NAME,
-    create_if_missing=True,
-)
+runtime_cache_volumes = {
+    artifact.name: modal.Volume.from_name(
+        artifact.volume_name,
+        create_if_missing=True,
+    )
+    for artifact in RUNTIME_CACHE_ARTIFACTS
+}
+runtime_cache_mounts = {
+    artifact.local_path: runtime_cache_volumes[artifact.name]
+    for artifact in RUNTIME_CACHE_ARTIFACTS
+}
 hf_secret = modal.Secret.from_name("huggingface")
+github_secret = modal.Secret.from_name("github")
 
 download_image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -76,6 +102,12 @@ download_image = (
     )
     .add_local_dir("helpers", "/root/helpers")
 )
+
+cache_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .add_local_dir("helpers", "/root/helpers")
+)
+
 
 runtime_image = (
     modal.Image.from_registry("vllm/vllm-openai:glm53-flash", add_python="3.12")
@@ -107,6 +139,61 @@ app = modal.App(APP_NAME)
 def step_001_download():
     """下载并缓存固定 revision 的模型权重；已完整缓存时直接返回。"""
     step_001_download_model(MODEL, REVISION, volume)
+
+
+def _restore_runtime_caches() -> dict[str, str]:
+    results: dict[str, str] = {}
+    for artifact in RUNTIME_CACHE_ARTIFACTS:
+        source = step_009_restore_cache(
+            artifact,
+            github_repo=GITHUB_REPO,
+            release_tag=CACHE_RELEASE_TAG,
+        )
+        results[artifact.name] = source
+        if source == "github":
+            runtime_cache_volumes[artifact.name].commit()
+            print(
+                f"[009_CACHE_MODAL_COMMIT] name={artifact.name} source=github",
+                flush=True,
+            )
+    return results
+
+
+def _publish_runtime_caches() -> dict[str, bool]:
+    results: dict[str, bool] = {}
+    for artifact in RUNTIME_CACHE_ARTIFACTS:
+        results[artifact.name] = step_010_publish_cache(
+            artifact,
+            github_repo=GITHUB_REPO,
+            release_tag=CACHE_RELEASE_TAG,
+        )
+    return results
+
+
+@app.function(
+    image=cache_image,
+    cpu=1,
+    memory=1024,
+    timeout=900,
+    secrets=[github_secret],
+    volumes=runtime_cache_mounts,
+)
+def step_009_restore_runtime_caches():
+    """CPU 阶段：Volume 优先，缺失时从 GitHub Release 恢复运行时缓存。"""
+    return _restore_runtime_caches()
+
+
+@app.function(
+    image=cache_image,
+    cpu=1,
+    memory=1024,
+    timeout=900,
+    secrets=[github_secret],
+    volumes=runtime_cache_mounts,
+)
+def step_010_publish_runtime_caches():
+    """CPU 阶段：确保当前可移植缓存已有 GitHub Release 备份。"""
+    return _publish_runtime_caches()
 
 
 @app.function(
@@ -146,15 +233,15 @@ def step_002_bench_weights(
     min_containers=0,
     max_containers=MAX_B300_CONTAINERS,
     buffer_containers=0,
-    volumes={
-        HF_CACHE: volume,
-        FLASHINFER_AUTOTUNE_CACHE: flashinfer_autotune_volume,
-    },
+    volumes={HF_CACHE: volume, **runtime_cache_mounts},
+    secrets=[github_secret],
 )
 @modal.concurrent(max_inputs=MAX_CONCURRENT_INPUTS)
 @modal.web_server(8000, startup_timeout=1800)
 def serve():
     """启动单 B300 vLLM 服务，并在服务就绪后自动发送一次最小 warmup 请求。"""
+    cache_sources = _restore_runtime_caches()
+
     strategy = os.environ.get(
         "GLM53_LOAD_STRATEGY",
         "prefetch",
@@ -229,12 +316,26 @@ def serve():
 
     def warmup_once(api_ready_at: float) -> None:
         """008：API Ready 后执行一次最小真实 generation warmup。"""
-        flashinfer_autotune_volume.commit()
-        print(
-            "[FLASHINFER_AUTOTUNE_CACHE_COMMIT] "
-            f"path={FLASHINFER_AUTOTUNE_CACHE}",
-            flush=True,
-        )
+        for artifact in RUNTIME_CACHE_ARTIFACTS:
+            runtime_cache_volumes[artifact.name].commit()
+            print(
+                f"[RUNTIME_CACHE_COMMIT] name={artifact.name} path={artifact.local_path}",
+                flush=True,
+            )
+            if cache_sources.get(artifact.name) != "miss":
+                continue
+            try:
+                step_010_publish_cache(
+                    artifact,
+                    github_repo=GITHUB_REPO,
+                    release_tag=CACHE_RELEASE_TAG,
+                )
+            except Exception as exc:
+                print(
+                    "[010_CACHE_PUBLISH_FAILED] "
+                    f"name={artifact.name} error={type(exc).__name__}",
+                    flush=True,
+                )
         step_008_run_warmup(
             model=MODEL,
             process_started_at=vllm_handle.started_at,
