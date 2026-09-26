@@ -595,6 +595,11 @@ def _sync_runtime_caches(
                 f"before_files={len(before)} after_files={len(after)}",
                 flush=True,
             )
+            print(
+                "[CACHE_VOLUME_SAFE] "
+                f"name={artifact.name} changed={str(changed).lower()}",
+                flush=True,
+            )
 
         cache_volumes[artifact.name].commit()
         print(
