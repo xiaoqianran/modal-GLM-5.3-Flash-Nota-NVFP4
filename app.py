@@ -178,6 +178,10 @@ MAX_CUDAGRAPH_CAPTURE_SIZE = CUDAGRAPH_CAPTURE_SIZES[-1]
 SCALEDOWN_WINDOW_SECONDS = 1800
 RUNTIME_CPU_MEMORY_MIB = 307200
 STARTUP_TIMEOUT_SECONDS = 1800
+RUNTIME_CACHE_SYNC_ENABLED = os.getenv(
+    "GLM53_RUNTIME_CACHE_SYNC",
+    "0",
+).strip().lower() in {"1", "true", "yes", "on"}
 PRODUCTION_SERVING_PROFILE_SHA256 = (
     "4e2c2ebecbb8b6f96a7827159d99ec7d5ddfdbc81c4b26ddef4bfddc61443fd2"
 )
@@ -272,7 +276,6 @@ runtime_image = (
             "CUDA_VISIBLE_DEVICES": "0",
             "HF_HOME": HF_CACHE,
             "HF_HUB_OFFLINE": "1",
-            "VLLM_SERVER_DEV_MODE": "1",
             "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": FLASHINFER_AUTOTUNE_RUNTIME_CACHE,
             "FLASHINFER_WORKSPACE_BASE": FLASHINFER_WORKSPACE_BASE,
             "TORCHINDUCTOR_COMPILE_THREADS": "1",
@@ -594,7 +597,6 @@ def _build_vllm_command(model_path: str) -> list[str]:
         "--reasoning-parser",
         "glm45",
         "--enable-auto-tool-choice",
-        "--enable-sleep-mode",
     ]
 
     if strategy != "default":
@@ -766,10 +768,14 @@ class VllmServer:
         )
 
         cache_sources = _restore_cache_artifacts(RUNTIME_CACHE_ARTIFACTS)
-        cache_fingerprints_before = {
-            artifact.name: cache_fingerprint(artifact)
-            for artifact in RUNTIME_CACHE_ARTIFACTS
-        }
+        cache_fingerprints_before = (
+            {
+                artifact.name: cache_fingerprint(artifact)
+                for artifact in RUNTIME_CACHE_ARTIFACTS
+            }
+            if RUNTIME_CACHE_SYNC_ENABLED
+            else {}
+        )
         _stage_runtime_caches()
         model_path = step_016_prepare_model_mirror(
             hf_cache=HF_CACHE,
@@ -803,10 +809,20 @@ class VllmServer:
             api_ready_at=api_ready_at,
             repeats=3,
         )
-        self.cache_sync_thread = _start_runtime_cache_sync(
-            cache_sources,
-            cache_fingerprints_before,
-        )
+        if RUNTIME_CACHE_SYNC_ENABLED:
+            self.cache_sync_thread = _start_runtime_cache_sync(
+                cache_sources,
+                cache_fingerprints_before,
+            )
+        else:
+            self.cache_sync_thread = None
+            print(
+                "[CACHE_SYNC_SKIP] "
+                "reason=stable_production_cache "
+                "volume_cache=read_only_during_serving "
+                "github_backup=cpu_worker",
+                flush=True,
+            )
         print(
             "[RUNTIME_READY] "
             f"elapsed_s={time.perf_counter() - startup_started_at:.3f}",
@@ -824,15 +840,6 @@ class VllmServer:
     @modal.exit()
     def shutdown(self) -> None:
         """容器退出时回收 vLLM 子进程。"""
-        cache_sync_thread = getattr(self, "cache_sync_thread", None)
-        if cache_sync_thread is not None and cache_sync_thread.is_alive():
-            cache_sync_thread.join(timeout=30)
-            if cache_sync_thread.is_alive():
-                print(
-                    "[CACHE_SYNC_BACKGROUND_EXIT_TIMEOUT] timeout_s=30",
-                    flush=True,
-                )
-
         handle = getattr(self, "vllm_handle", None)
         if handle is None:
             return
