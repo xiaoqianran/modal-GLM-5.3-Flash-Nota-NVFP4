@@ -36,6 +36,9 @@ cache_restore_module = importlib.import_module("helpers.009_cache_restore")
 CacheArtifact = cache_restore_module.CacheArtifact
 cache_fingerprint = cache_restore_module.cache_fingerprint
 step_009_restore_cache = cache_restore_module.step_009_restore_cache
+step_010_publish_cache = importlib.import_module(
+    "helpers.010_cache_publish"
+).step_010_publish_cache
 step_011_discover_runtime_caches = importlib.import_module(
     "helpers.011_cache_discovery"
 ).step_011_discover_runtime_caches
@@ -43,12 +46,15 @@ cache_staging_module = importlib.import_module("helpers.012_cache_staging")
 step_012_stage_cache = cache_staging_module.step_012_stage_cache
 step_012_sync_cache = cache_staging_module.step_012_sync_cache
 step_012_cache_dirty = cache_staging_module.step_012_cache_dirty
+step_012_clear_dirty = cache_staging_module.step_012_clear_dirty
 archive_staging_module = importlib.import_module("helpers.013_stage_archive")
 step_013_stage_archive = archive_staging_module.step_013_stage_archive
 step_013_sync_archive = archive_staging_module.step_013_sync_archive
 step_013_compact_legacy_seed = archive_staging_module.step_013_compact_legacy_seed
 cache_backup_state = importlib.import_module("helpers.015_cache_backup_state")
 mark_cache_backup_dirty = cache_backup_state.mark_cache_backup_dirty
+is_cache_backup_dirty = cache_backup_state.is_cache_backup_dirty
+clear_cache_backup_dirty = cache_backup_state.clear_cache_backup_dirty
 step_016_prepare_model_mirror = importlib.import_module(
     "helpers.016_model_mirror"
 ).step_016_prepare_model_mirror
@@ -87,8 +93,6 @@ CUDA_COMPUTE_VOLUME_NAME = "glm53-flash-nota-cuda-compute-cache"
 
 GITHUB_REPO = "xiaoqianran/modal-GLM-5.3-Flash-Nota-NVFP4"
 CACHE_RELEASE_TAG = "cache-b300-glm53-flash-nota-v1"
-CACHE_BACKUP_APP_NAME = "glm53-cache-backup"
-CACHE_BACKUP_FUNCTION_NAME = "backup_runtime_caches"
 RUNTIME_CACHE_ARTIFACTS = (
     CacheArtifact(
         name="flashinfer-autotune",
@@ -325,26 +329,76 @@ def _restore_runtime_caches() -> dict[str, str]:
 
 
 def _spawn_cache_backup() -> None:
-    """把 GitHub 备份交给独立 CPU App；当前 B300 不等待上传完成。"""
+    """把 GitHub 备份交给同一 Modal App 的独立 CPU function；B300 不等待。"""
     try:
-        backup_function = modal.Function.from_name(
-            CACHE_BACKUP_APP_NAME,
-            CACHE_BACKUP_FUNCTION_NAME,
-        )
-        backup_function.spawn()
+        backup_runtime_caches.spawn()
         print(
             "[CACHE_BACKUP_SPAWNED] "
-            f"app={CACHE_BACKUP_APP_NAME} "
-            f"function={CACHE_BACKUP_FUNCTION_NAME}",
+            f"app={APP_NAME} function=backup_runtime_caches",
             flush=True,
         )
     except Exception as exc:
         print(
             "[CACHE_BACKUP_SPAWN_FAILED] "
-            f"app={CACHE_BACKUP_APP_NAME} "
-            f"error={type(exc).__name__}: {exc}",
+            f"app={APP_NAME} error={type(exc).__name__}: {exc}",
             flush=True,
         )
+
+
+def _selected_cache_artifacts(artifact_names: list[str] | None):
+    if artifact_names is None:
+        return ALL_CACHE_ARTIFACTS
+    requested = set(artifact_names)
+    known = {artifact.name for artifact in ALL_CACHE_ARTIFACTS}
+    unknown = requested - known
+    if unknown:
+        raise ValueError(f"Unknown cache artifacts: {sorted(unknown)}")
+    return tuple(
+        artifact for artifact in ALL_CACHE_ARTIFACTS if artifact.name in requested
+    )
+
+
+def _backup_runtime_caches(
+    artifact_names: list[str] | None = None,
+    *,
+    replace_names: list[str] | None = None,
+    force: bool = False,
+) -> dict[str, bool]:
+    """CPU worker implementation shared by scheduled and forced backups."""
+    replace_requested = set(replace_names or ())
+    results: dict[str, bool] = {}
+    for artifact in _selected_cache_artifacts(artifact_names):
+        generic_dirty = is_cache_backup_dirty(artifact.local_path)
+        staged_dirty = (
+            artifact.name in STAGED_CACHE_NAMES
+            and step_012_cache_dirty(artifact.local_path)
+        )
+        replace_existing = (
+            force
+            or artifact.name in replace_requested
+            or generic_dirty
+            or staged_dirty
+        )
+        published = step_010_publish_cache(
+            artifact,
+            github_repo=GITHUB_REPO,
+            release_tag=CACHE_RELEASE_TAG,
+            replace_existing=replace_existing,
+        )
+        results[artifact.name] = published
+        if not published:
+            continue
+
+        marker_cleared = False
+        if generic_dirty:
+            clear_cache_backup_dirty(artifact.local_path)
+            marker_cleared = True
+        if staged_dirty:
+            step_012_clear_dirty(artifact.local_path)
+            marker_cleared = True
+        if marker_cleared:
+            cache_volumes[artifact.name].commit()
+    return results
 
 
 @app.function(
@@ -358,6 +412,44 @@ def _spawn_cache_backup() -> None:
 def step_009_restore_runtime_caches():
     """CPU 阶段：Volume 优先，缺失时从 GitHub Release 恢复运行时缓存。"""
     return _restore_runtime_caches()
+
+
+@app.function(
+    image=cache_image,
+    cpu=2,
+    memory=8192,
+    timeout=3600,
+    max_containers=1,
+    scaledown_window=60,
+    secrets=[github_secret],
+    volumes=cache_mounts,
+    schedule=modal.Period(hours=1),
+)
+def backup_runtime_caches(
+    artifact_names: list[str] | None = None,
+    replace_names: list[str] | None = None,
+):
+    """同一 App 内的独立 CPU worker；每小时兜底检查一次，不占 B300。"""
+    return _backup_runtime_caches(
+        artifact_names,
+        replace_names=replace_names,
+        force=False,
+    )
+
+
+@app.function(
+    image=cache_image,
+    cpu=2,
+    memory=8192,
+    timeout=3600,
+    max_containers=1,
+    scaledown_window=60,
+    secrets=[github_secret],
+    volumes=cache_mounts,
+)
+def backup_all_force():
+    """部署阶段使用：强制刷新全部已就绪 cache 到 GitHub Release。"""
+    return _backup_runtime_caches(force=True)
 
 
 @app.function(

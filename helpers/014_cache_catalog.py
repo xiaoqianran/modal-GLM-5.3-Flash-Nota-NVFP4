@@ -32,9 +32,6 @@ CUDA_COMPUTE_VOLUME_NAME = "glm53-flash-nota-cuda-compute-cache"
 GITHUB_REPO = "xiaoqianran/modal-GLM-5.3-Flash-Nota-NVFP4"
 CACHE_RELEASE_TAG = "cache-b300-glm53-flash-nota-v1"
 
-CACHE_BACKUP_APP_NAME = "glm53-cache-backup"
-CACHE_BACKUP_FUNCTION_NAME = "backup_runtime_caches"
-
 RUNTIME_CACHE_ARTIFACTS = (
     CacheArtifact(
         name="flashinfer-autotune",

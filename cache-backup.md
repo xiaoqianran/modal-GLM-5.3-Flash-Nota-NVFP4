@@ -5,7 +5,8 @@
 - Modal Volume 是运行时主缓存。
 - GitHub Release 是可移植备份 / fallback。
 - B300 只负责生成缓存并 commit 到 Volume，不等待 GitHub 上传。
-- GitHub 上传由独立 CPU App `glm53-cache-backup` 完成。
+- GitHub 上传由主 App `glm53-flash-nota-b300` 内的独立 CPU function 完成。
+- CPU cache worker 与 B300 serving 属于同一个 Modal App，因此 deploy / stop 生命周期一致。
 
 ## 运行链路
 
@@ -15,10 +16,10 @@ B300 warmup
   -> .github-backup-dirty
   -> Modal Volume commit
   -> CACHE_VOLUME_SAFE
-  -> spawn glm53-cache-backup
+  -> spawn backup_runtime_caches (CPU function, same Modal App)
   -> B300 可立即停止
 
-glm53-cache-backup
+glm53-flash-nota-b300 / backup_runtime_caches
   -> 读取 Modal Volume
   -> 打包 cache
   -> 安全替换 GitHub Release asset
@@ -54,22 +55,18 @@ glm53-cache-backup
 
 ## 手动操作
 
-部署 backup worker：
-
-```powershell
-uv run modal deploy cache_backup_app.py
-```
+backup worker 随 `modal deploy app.py` 一起部署，不再单独部署第二个 App。
 
 强制刷新所有已就绪缓存：
 
 ```powershell
-uv run python -c "import modal; print(modal.Function.from_name('glm53-cache-backup','backup_all_force').remote())"
+uv run python -c "import modal; print(modal.Function.from_name('glm53-flash-nota-b300','backup_all_force').remote())"
 ```
 
 普通增量检查：
 
 ```powershell
-uv run python -c "import modal; print(modal.Function.from_name('glm53-cache-backup','backup_runtime_caches').remote())"
+uv run python -c "import modal; print(modal.Function.from_name('glm53-flash-nota-b300','backup_runtime_caches').remote())"
 ```
 
-`delete-modal.bat` 只停止 `glm53-flash-nota-b300`，不会停止独立 CPU backup app。
+`delete-modal.bat` 停止 `glm53-flash-nota-b300` 时，B300 serving、定时 CPU backup worker 和手动 backup function 会一起停止。
