@@ -43,9 +43,16 @@ step_012_stage_cache = cache_staging_module.step_012_stage_cache
 step_012_sync_cache = cache_staging_module.step_012_sync_cache
 step_012_cache_dirty = cache_staging_module.step_012_cache_dirty
 step_012_clear_dirty = cache_staging_module.step_012_clear_dirty
+archive_staging_module = importlib.import_module("helpers.013_stage_archive")
+step_013_stage_archive = archive_staging_module.step_013_stage_archive
+step_013_sync_archive = archive_staging_module.step_013_sync_archive
+step_013_compact_legacy_seed = archive_staging_module.step_013_compact_legacy_seed
 
 
 APP_NAME = os.getenv("GLM53_APP_NAME", "glm53-flash-nota-b300")
+MODAL_WORKSPACE = os.getenv("GLM53_MODAL_WORKSPACE", "zhiyuqqq")
+PUBLIC_BASE_URL = f"https://{MODAL_WORKSPACE}--{APP_NAME}-serve.modal.run"
+PUBLIC_OPENAI_BASE_URL = f"{PUBLIC_BASE_URL}/v1"
 MODEL = "nota-ai/GLM-5.3-Flash-Nota-NVFP4"
 REVISION = "c5fc7f5ef0447ab030559bb4b08861a36dbbe847"
 
@@ -100,14 +107,14 @@ STAGED_CACHE_ARTIFACTS = (
         local_path=TRITON_CACHE_SEED,
         volume_name=TRITON_VOLUME_NAME,
         release_asset="triton-b300.tar.gz",
-        required_globs=("**/*.autotune.json", "**/*.cubin", "**/*.so", "**/*.json"),
+        required_globs=(".stage-cache.tar",),
     ),
     CacheArtifact(
         name="torchinductor",
         local_path=TORCHINDUCTOR_CACHE_SEED,
         volume_name=TORCHINDUCTOR_VOLUME_NAME,
         release_asset="torchinductor-b300.tar.gz",
-        required_globs=("**/*.cubin", "**/*.so", "**/*.json", "**/*.ptx", "**/*.ttir", "**/*.py", "**/*.best_config"),
+        required_globs=(".stage-cache.tar",),
     ),
     CacheArtifact(
         name="cuda-compute",
@@ -123,6 +130,7 @@ STAGED_CACHE_RUNTIME_PATHS = {
     "cuda-compute": CUDA_COMPUTE_CACHE,
 }
 STAGED_CACHE_NAMES = frozenset(STAGED_CACHE_RUNTIME_PATHS)
+ARCHIVED_STAGED_CACHE_NAMES = frozenset({"triton", "torchinductor"})
 ALL_CACHE_ARTIFACTS = RUNTIME_CACHE_ARTIFACTS + STAGED_CACHE_ARTIFACTS
 
 MAX_B300_CONTAINERS = 1
@@ -214,9 +222,9 @@ def step_001_download():
     step_001_download_model(MODEL, REVISION, volume)
 
 
-def _restore_runtime_caches() -> dict[str, str]:
+def _restore_cache_artifacts(artifacts) -> dict[str, str]:
     results: dict[str, str] = {}
-    for artifact in ALL_CACHE_ARTIFACTS:
+    for artifact in artifacts:
         source = step_009_restore_cache(
             artifact,
             github_repo=GITHUB_REPO,
@@ -230,6 +238,11 @@ def _restore_runtime_caches() -> dict[str, str]:
                 flush=True,
             )
     return results
+
+
+def _restore_runtime_caches() -> dict[str, str]:
+    """CPU 部署阶段恢复全部 cache；B300 启动阶段只恢复非 staged cache。"""
+    return _restore_cache_artifacts(ALL_CACHE_ARTIFACTS)
 
 
 def _publish_runtime_caches() -> dict[str, bool]:
@@ -283,6 +296,28 @@ def step_010_publish_runtime_caches():
 
 
 @app.function(
+    image=cache_image,
+    cpu=2,
+    memory=4096,
+    timeout=1800,
+    volumes=cache_mounts,
+)
+def step_013_compact_staged_archives():
+    """CPU 一次性迁移：把 Triton/Inductor 多文件 seed 收口为单归档。"""
+    results: dict[str, bool] = {}
+    for artifact in STAGED_CACHE_ARTIFACTS:
+        if artifact.name not in ARCHIVED_STAGED_CACHE_NAMES:
+            continue
+        changed = step_013_compact_legacy_seed(
+            artifact.local_path,
+            name=artifact.name,
+        )
+        results[artifact.name] = changed
+        cache_volumes[artifact.name].commit()
+    return results
+
+
+@app.function(
     image=runtime_image,
     gpu="B300",
     cpu=8,
@@ -326,17 +361,35 @@ def step_002_bench_weights(
 @modal.web_server(8000, startup_timeout=1800)
 def serve():
     """启动单 B300 vLLM 服务，并在服务就绪后自动发送一次最小 warmup 请求。"""
-    cache_sources = _restore_runtime_caches()
+    print(
+        f"[PUBLIC_API] base_url={PUBLIC_BASE_URL} openai_base_url={PUBLIC_OPENAI_BASE_URL}",
+        flush=True,
+    )
+    cache_sources = _restore_cache_artifacts(RUNTIME_CACHE_ARTIFACTS)
     cache_fingerprints_before = {
         artifact.name: cache_fingerprint(artifact)
-        for artifact in ALL_CACHE_ARTIFACTS
+        for artifact in RUNTIME_CACHE_ARTIFACTS
     }
     for artifact in STAGED_CACHE_ARTIFACTS:
-        step_012_stage_cache(
-            artifact.local_path,
-            STAGED_CACHE_RUNTIME_PATHS[artifact.name],
-            name=artifact.name,
-        )
+        runtime_path = STAGED_CACHE_RUNTIME_PATHS[artifact.name]
+        if artifact.name in ARCHIVED_STAGED_CACHE_NAMES:
+            archived = step_013_stage_archive(
+                artifact.local_path,
+                runtime_path,
+                name=artifact.name,
+            )
+            if not archived:
+                step_012_stage_cache(
+                    artifact.local_path,
+                    runtime_path,
+                    name=artifact.name,
+                )
+        else:
+            step_012_stage_cache(
+                artifact.local_path,
+                runtime_path,
+                name=artifact.name,
+            )
 
     strategy = os.environ.get(
         "GLM53_LOAD_STRATEGY",
@@ -418,13 +471,26 @@ def serve():
             api_ready_at=api_ready_at,
         )
         for artifact in STAGED_CACHE_ARTIFACTS:
-            step_012_sync_cache(
-                STAGED_CACHE_RUNTIME_PATHS[artifact.name],
-                artifact.local_path,
-                name=artifact.name,
+            runtime_path = STAGED_CACHE_RUNTIME_PATHS[artifact.name]
+            if artifact.name in ARCHIVED_STAGED_CACHE_NAMES:
+                step_013_sync_archive(
+                    runtime_path,
+                    artifact.local_path,
+                    name=artifact.name,
+                )
+            else:
+                step_012_sync_cache(
+                    runtime_path,
+                    artifact.local_path,
+                    name=artifact.name,
+                )
+            cache_volumes[artifact.name].commit()
+            print(
+                f"[RUNTIME_CACHE_COMMIT] name={artifact.name} path={artifact.local_path}",
+                flush=True,
             )
 
-        for artifact in ALL_CACHE_ARTIFACTS:
+        for artifact in RUNTIME_CACHE_ARTIFACTS:
             cache_volumes[artifact.name].commit()
             print(
                 f"[RUNTIME_CACHE_COMMIT] name={artifact.name} path={artifact.local_path}",
@@ -441,9 +507,6 @@ def serve():
                     flush=True,
                 )
 
-            if artifact.name in STAGED_CACHE_NAMES:
-                # Large staged caches are uploaded by the CPU cache job, never by the B300 process.
-                continue
             if not changed and cache_sources.get(artifact.name) != "miss":
                 continue
             try:

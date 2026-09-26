@@ -22,6 +22,8 @@ def _create_archive(source: Path, destination: Path) -> None:
     # Runtime caches are mostly compiled binaries; level 1 avoids wasting CPU on marginal compression.
     with tarfile.open(destination, "w:gz", compresslevel=1) as tar:
         for item in sorted(source.iterdir()):
+            if item.name == ".staged-cache-dirty":
+                continue
             tar.add(item, arcname=item.name, recursive=True)
 
 
