@@ -67,9 +67,13 @@ glm53-flash-nota-b300 / backup_runtime_caches
 
 避免“先删除唯一备份、随后上传失败”的风险。
 
-## 手动操作
+## 部署与手动操作
 
 backup worker 随 `modal deploy app.py` 一起部署，不再单独部署第二个 App。
+
+`deploy-modal.bat` 的第 `[7/7]` 步调用 `backup_runtime_caches`：只同步 dirty / missing cache；GitHub 已存在且内容未标记变化时直接命中，不重新打包或上传。
+
+`backup_all_force` 仅保留给人工修复/强制刷新，不参与常规 deploy。
 
 强制刷新所有已就绪缓存：
 
