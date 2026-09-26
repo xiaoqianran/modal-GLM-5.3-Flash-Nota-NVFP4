@@ -54,7 +54,7 @@ uv run modal app stop "glm53-cache-backup" --yes >nul 2>&1
 
 echo.
 echo [7/7] Sync changed or missing runtime caches to GitHub Release...
-uv run python -c "import modal; print(modal.Function.from_name('glm53-flash-nota-b300','backup_runtime_caches').remote())" || echo [WARN] GitHub cache backup failed; deployment will continue.
+uv run python -c "import modal; print(modal.Function.from_name('glm53-flash-nota-b300','backup_missing_or_dirty').remote())" || echo [WARN] GitHub cache backup failed; deployment will continue.
 
 echo.
 echo [OK] Deployment completed.

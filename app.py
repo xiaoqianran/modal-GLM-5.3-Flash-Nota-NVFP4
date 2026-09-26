@@ -367,6 +367,7 @@ def _backup_runtime_caches(
     *,
     replace_names: list[str] | None = None,
     force: bool = False,
+    ensure_existing: bool = False,
 ) -> dict[str, bool]:
     """CPU worker implementation shared by scheduled and forced backups."""
     replace_requested = set(replace_names or ())
@@ -377,6 +378,23 @@ def _backup_runtime_caches(
             artifact.name in STAGED_CACHE_NAMES
             and step_012_cache_dirty(artifact.local_path)
         )
+        needs_backup = (
+            force
+            or ensure_existing
+            or artifact.name in replace_requested
+            or generic_dirty
+            or staged_dirty
+        )
+
+        if not needs_backup:
+            results[artifact.name] = False
+            print(
+                "[CACHE_BACKUP_SKIP_CLEAN] "
+                f"name={artifact.name}",
+                flush=True,
+            )
+            continue
+
         replace_existing = (
             force
             or artifact.name in replace_requested
@@ -424,7 +442,9 @@ def step_009_restore_runtime_caches():
     memory=8192,
     timeout=3600,
     max_containers=1,
-    scaledown_window=60,
+    min_containers=0,
+    buffer_containers=0,
+    single_use_containers=True,
     secrets=[github_secret],
     volumes=project_mount,
     schedule=modal.Period(hours=1),
@@ -433,11 +453,12 @@ def backup_runtime_caches(
     artifact_names: list[str] | None = None,
     replace_names: list[str] | None = None,
 ):
-    """同一 App 内的独立 CPU worker；每小时兜底检查一次，不占 B300。"""
+    """每小时只检查 dirty marker；全部 clean 时立即退出，不扫描/打包 cache。"""
     return _backup_runtime_caches(
         artifact_names,
         replace_names=replace_names,
         force=False,
+        ensure_existing=False,
     )
 
 
@@ -454,6 +475,26 @@ def backup_runtime_caches(
 def backup_all_force():
     """部署阶段使用：强制刷新全部已就绪 cache 到 GitHub Release。"""
     return _backup_runtime_caches(force=True)
+
+
+@app.function(
+    image=cache_image,
+    cpu=2,
+    memory=8192,
+    timeout=3600,
+    max_containers=1,
+    min_containers=0,
+    buffer_containers=0,
+    single_use_containers=True,
+    secrets=[github_secret],
+    volumes=project_mount,
+)
+def backup_missing_or_dirty():
+    """部署阶段：补缺失 asset；dirty 才替换已有 asset。"""
+    return _backup_runtime_caches(
+        force=False,
+        ensure_existing=True,
+    )
 
 
 @app.function(
