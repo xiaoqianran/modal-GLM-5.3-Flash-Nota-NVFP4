@@ -44,21 +44,18 @@ for /f "usebackq delims=" %%C in (`uv run python -c "import json; rows=json.load
 
 del /q "%APP_JSON%" "%CONTAINER_JSON%" >nul 2>&1
 
-if "%FOUND_B300%"=="0" (
-  echo [OK] No running B300 container was found. The deployment remains active.
-  pause
-  exit /b 0
-)
-
 if not "%STOP_FAILED%"=="0" (
   echo [ERROR] One or more B300 containers could not be stopped.
   pause
   exit /b 1
 )
 
+rem Always perform the final verification, even when the first inspection did
+rem not positively identify a B300. A container can be Pending and temporarily
+rem reject "modal container exec" while still being a real B300 allocation.
 call :verify_b300_gone
 if not "%VERIFY_FAILED%"=="0" (
-  echo [ERROR] A B300 container is still alive after stop attempts.
+  echo [ERROR] Could not prove that every B300 container is stopped.
   echo [ERROR] Deployment was NOT stopped. Inspect the remaining Modal input/request.
   pause
   exit /b 1
@@ -116,6 +113,7 @@ set "VERIFY_ATTEMPT=0"
 :verify_loop
 set /a VERIFY_ATTEMPT+=1
 set "LIVE_B300=0"
+set "UNKNOWN_CONTAINER=0"
 set "VERIFY_JSON=%TEMP%\glm53-verify-%RANDOM%-%RANDOM%.json"
 
 rem Give Modal control-plane state a short moment to settle.
@@ -133,41 +131,72 @@ for /f "usebackq delims=" %%C in (`uv run python -c "import json; rows=json.load
 )
 del /q "%VERIFY_JSON%" >nul 2>&1
 
-if "%LIVE_B300%"=="0" (
+if "%LIVE_B300%"=="0" if "%UNKNOWN_CONTAINER%"=="0" (
   echo [VERIFY] No live B300 found.
   exit /b 0
 )
 
-if %VERIFY_ATTEMPT% GEQ 5 (
+if %VERIFY_ATTEMPT% GEQ 10 (
   set "VERIFY_FAILED=1"
   exit /b 0
 )
 
-echo [VERIFY] B300 still alive; retrying stop ^(%VERIFY_ATTEMPT%/5^)...
+if "%LIVE_B300%"=="1" (
+  echo [VERIFY] B300 still alive; retrying stop ^(%VERIFY_ATTEMPT%/10^)...
+) else (
+  echo [VERIFY] Container state is still unknown; refusing false success ^(%VERIFY_ATTEMPT%/10^)...
+)
 goto :verify_loop
 
 :verify_one_container
 set "VERIFY_CID=%~1"
 set "VERIFY_GPU=%TEMP%\glm53-verify-gpu-%RANDOM%-%RANDOM%.txt"
+set "VERIFY_LOG=%TEMP%\glm53-verify-log-%RANDOM%-%RANDOM%.txt"
 
 uv run modal container exec --no-pty "%VERIFY_CID%" -- nvidia-smi -L > "%VERIFY_GPU%" 2>&1
 if errorlevel 1 (
-  rem A stopped/detached container may linger briefly in container list.
-  rem If exec is impossible, it is not an actively usable B300.
-  del /q "%VERIFY_GPU%" >nul 2>&1
+  rem IMPORTANT: exec failure is not evidence that the container is gone.
+  rem During B300 startup Modal can list a Pending container before exec works.
+  rem Use logs as a second signal; if that is also inconclusive, mark UNKNOWN
+  rem and fail closed instead of reporting a false successful stop.
+  uv run modal container logs "%VERIFY_CID%" --tail 200 > "%VERIFY_LOG%" 2>&1
+  if not errorlevel 1 (
+    findstr /i /c:"[RUNTIME_START]" /c:"[003_VLLM_PROCESS_START]" /c:"[007_API_READY]" "%VERIFY_LOG%" >nul
+    if not errorlevel 1 (
+      set "LIVE_B300=1"
+      echo [VERIFY] B300 identified from logs while exec is unavailable: %VERIFY_CID%
+      uv run modal container stop "%VERIFY_CID%" --yes >nul 2>&1
+      del /q "%VERIFY_GPU%" "%VERIFY_LOG%" >nul 2>&1
+      exit /b 0
+    )
+
+    rem These markers belong to the CPU-only cache worker. Only explicit CPU
+    rem evidence is allowed to classify an exec-unavailable container as non-B300.
+    findstr /i /c:"[CACHE_BACKUP_SKIP_CLEAN]" /c:"[CACHE_BACKUP_" "%VERIFY_LOG%" >nul
+    if not errorlevel 1 (
+      echo [VERIFY] CPU cache worker confirmed: %VERIFY_CID%
+      del /q "%VERIFY_GPU%" "%VERIFY_LOG%" >nul 2>&1
+      exit /b 0
+    )
+  )
+
+  set "UNKNOWN_CONTAINER=1"
+  echo [VERIFY] UNKNOWN container ^(exec unavailable, no decisive logs^): %VERIFY_CID%
+  del /q "%VERIFY_GPU%" "%VERIFY_LOG%" >nul 2>&1
   exit /b 0
 )
 
 findstr /i /c:"B300" "%VERIFY_GPU%" >nul
 if errorlevel 1 (
-  del /q "%VERIFY_GPU%" >nul 2>&1
+  rem Successful nvidia-smi without B300 is decisive: this is not our target.
+  del /q "%VERIFY_GPU%" "%VERIFY_LOG%" >nul 2>&1
   exit /b 0
 )
 
 set "LIVE_B300=1"
 echo [VERIFY] Live B300: %VERIFY_CID%
 type "%VERIFY_GPU%"
-del /q "%VERIFY_GPU%" >nul 2>&1
+del /q "%VERIFY_GPU%" "%VERIFY_LOG%" >nul 2>&1
 uv run modal container stop "%VERIFY_CID%" --yes >nul 2>&1
 exit /b 0
 
