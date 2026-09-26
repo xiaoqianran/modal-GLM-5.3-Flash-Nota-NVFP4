@@ -1,0 +1,249 @@
+import importlib
+import json
+import os
+
+import modal
+
+step_001_download_model = importlib.import_module(
+    "helpers.001_download_model"
+).step_001_download_model
+step_002_benchmark_weights = importlib.import_module(
+    "helpers.002_benchmark_weights"
+).step_002_benchmark_weights
+step_003_start_vllm_with_model_init_observer = importlib.import_module(
+    "helpers.003_model_init"
+).step_003_start_vllm_with_model_init_observer
+step_004_create_kv_cache_observer = importlib.import_module(
+    "helpers.004_kv_cache"
+).step_004_create_kv_cache_observer
+step_005_create_kernel_jit_observer = importlib.import_module(
+    "helpers.005_kernel_jit"
+).step_005_create_kernel_jit_observer
+step_006_create_cuda_graph_observer = importlib.import_module(
+    "helpers.006_cuda_graph"
+).step_006_create_cuda_graph_observer
+step_007_start_api_ready_observer = importlib.import_module(
+    "helpers.007_api_ready"
+).step_007_start_api_ready_observer
+step_008_run_warmup = importlib.import_module(
+    "helpers.008_warmup"
+).step_008_run_warmup
+
+
+APP_NAME = os.getenv("GLM53_APP_NAME", "glm53-flash-nota-b300")
+MODEL = "nota-ai/GLM-5.3-Flash-Nota-NVFP4"
+REVISION = "c5fc7f5ef0447ab030559bb4b08861a36dbbe847"
+
+HF_CACHE = "/root/.cache/huggingface"
+HF_VOLUME_NAME = "glm53-flash-nota-hf-cache"
+FLASHINFER_AUTOTUNE_CACHE = "/root/.cache/vllm/flashinfer_autotune_cache"
+FLASHINFER_AUTOTUNE_VOLUME_NAME = "glm53-flash-nota-flashinfer-autotune"
+
+MAX_B300_CONTAINERS = 1
+MAX_CONCURRENT_INPUTS = 16
+SCALEDOWN_WINDOW_SECONDS = 1800
+
+# 已实测：Modal Volume(9P) 上 prefetch-16 明显优于 default / eager。
+LOAD_STRATEGY = os.getenv("GLM53_LOAD_STRATEGY", "prefetch").strip().lower()
+PREFETCH_THREADS = int(os.getenv("GLM53_PREFETCH_THREADS", "16"))
+PREFETCH_BLOCK_MIB = int(os.getenv("GLM53_PREFETCH_BLOCK_MIB", "16"))
+
+if LOAD_STRATEGY not in {"default", "lazy", "prefetch", "eager"}:
+    raise ValueError(f"Unsupported GLM53_LOAD_STRATEGY={LOAD_STRATEGY!r}")
+if PREFETCH_THREADS < 1:
+    raise ValueError("GLM53_PREFETCH_THREADS must be >= 1")
+if PREFETCH_BLOCK_MIB < 1:
+    raise ValueError("GLM53_PREFETCH_BLOCK_MIB must be >= 1")
+
+
+volume = modal.Volume.from_name(HF_VOLUME_NAME, create_if_missing=True)
+flashinfer_autotune_volume = modal.Volume.from_name(
+    FLASHINFER_AUTOTUNE_VOLUME_NAME,
+    create_if_missing=True,
+)
+hf_secret = modal.Secret.from_name("huggingface")
+
+download_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .uv_pip_install("huggingface_hub[hf_xet]")
+    .env(
+        {
+            "HF_HOME": HF_CACHE,
+            "HF_XET_HIGH_PERFORMANCE": "1",
+            "HF_XET_CLIENT_RETRY_MAX_ATTEMPTS": "10",
+            "HF_XET_CLIENT_RETRY_MAX_DURATION": "600s",
+        }
+    )
+    .add_local_dir("helpers", "/root/helpers")
+)
+
+runtime_image = (
+    modal.Image.from_registry("vllm/vllm-openai:glm53-flash", add_python="3.12")
+    .entrypoint([])
+    .env(
+        {
+            "CUDA_VISIBLE_DEVICES": "0",
+            "HF_HOME": HF_CACHE,
+            "HF_HUB_OFFLINE": "1",
+            "GLM53_LOAD_STRATEGY": LOAD_STRATEGY,
+            "GLM53_PREFETCH_THREADS": str(PREFETCH_THREADS),
+            "GLM53_PREFETCH_BLOCK_MIB": str(PREFETCH_BLOCK_MIB),
+        }
+    )
+    .add_local_dir("helpers", "/root/helpers")
+)
+
+app = modal.App(APP_NAME)
+
+
+@app.function(
+    image=download_image,
+    cpu=4,
+    memory=65536,
+    timeout=14400,
+    secrets=[hf_secret],
+    volumes={HF_CACHE: volume},
+)
+def step_001_download():
+    """下载并缓存固定 revision 的模型权重；已完整缓存时直接返回。"""
+    step_001_download_model(MODEL, REVISION, volume)
+
+
+@app.function(
+    image=runtime_image,
+    gpu="B300",
+    cpu=8,
+    memory=32768,
+    timeout=900,
+    scaledown_window=SCALEDOWN_WINDOW_SECONDS,
+    min_containers=0,
+    max_containers=1,
+    buffer_containers=0,
+    volumes={HF_CACHE: volume},
+)
+def step_002_bench_weights(
+    strategy: str = "prefetch",
+    threads: int = 16,
+    block_mib: int = 16,
+):
+    """仅测试 386 个 safetensors shard 的读取路径，不启动 vLLM 或 CUDA Graph。"""
+    step_002_benchmark_weights(
+        HF_CACHE,
+        REVISION,
+        strategy=strategy,
+        threads=threads,
+        block_mib=block_mib,
+    )
+
+
+@app.function(
+    image=runtime_image,
+    gpu="B300",
+    cpu=8,
+    memory=32768,
+    timeout=1800,
+    scaledown_window=SCALEDOWN_WINDOW_SECONDS,
+    min_containers=0,
+    max_containers=MAX_B300_CONTAINERS,
+    buffer_containers=0,
+    volumes={
+        HF_CACHE: volume,
+        FLASHINFER_AUTOTUNE_CACHE: flashinfer_autotune_volume,
+    },
+)
+@modal.concurrent(max_inputs=MAX_CONCURRENT_INPUTS)
+@modal.web_server(8000, startup_timeout=1800)
+def serve():
+    """启动单 B300 vLLM 服务，并在服务就绪后自动发送一次最小 warmup 请求。"""
+    strategy = os.environ.get(
+        "GLM53_LOAD_STRATEGY",
+        "prefetch",
+    ).strip().lower()
+    prefetch_threads = int(
+        os.environ.get("GLM53_PREFETCH_THREADS", "16")
+    )
+    prefetch_block_mib = int(
+        os.environ.get("GLM53_PREFETCH_BLOCK_MIB", "16")
+    )
+
+    command = [
+        "vllm",
+        "serve",
+        MODEL,
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--served-model-name",
+        MODEL,
+        "--revision",
+        REVISION,
+        "--tensor-parallel-size",
+        "1",
+        "--gpu-memory-utilization",
+        "0.96",
+        "--enforce-eager",
+        "--compilation-config",
+        json.dumps({"cudagraph_mode": "PIECEWISE"}),
+        "--max-cudagraph-capture-size",
+        "1008",
+        "--kv-cache-dtype",
+        "fp8",
+        "--speculative-config",
+        json.dumps({"method": "mtp", "num_speculative_tokens": 5}),
+        "--tool-call-parser",
+        "glm47",
+        "--reasoning-parser",
+        "glm45",
+        "--enable-auto-tool-choice",
+    ]
+
+    if strategy != "default":
+        command += ["--safetensors-load-strategy", strategy]
+
+    if strategy == "prefetch":
+        command += [
+            "--safetensors-prefetch-num-threads",
+            str(prefetch_threads),
+            "--safetensors-prefetch-block-size",
+            str(prefetch_block_mib * 1024 * 1024),
+        ]
+
+    print(
+        "[MODEL_LOAD] "
+        f"strategy={strategy} "
+        f"prefetch_threads={prefetch_threads} "
+        f"prefetch_block_mib={prefetch_block_mib}",
+        flush=True,
+    )
+
+    # 003~006：保持单一 vLLM 进程，并按阶段旁路观测同一份真实日志。
+    vllm_handle = step_003_start_vllm_with_model_init_observer(
+        command,
+        extra_observer_factories=[
+            step_004_create_kv_cache_observer,
+            step_005_create_kernel_jit_observer,
+            step_006_create_cuda_graph_observer,
+        ],
+    )
+
+    def warmup_once(api_ready_at: float) -> None:
+        """008：API Ready 后执行一次最小真实 generation warmup。"""
+        flashinfer_autotune_volume.commit()
+        print(
+            "[FLASHINFER_AUTOTUNE_CACHE_COMMIT] "
+            f"path={FLASHINFER_AUTOTUNE_CACHE}",
+            flush=True,
+        )
+        step_008_run_warmup(
+            model=MODEL,
+            process_started_at=vllm_handle.started_at,
+            api_ready_at=api_ready_at,
+        )
+
+    # 007/008：HTTP 200 确认 API Ready 后，立即执行最小真实 generation。
+    step_007_start_api_ready_observer(
+        process=vllm_handle.process,
+        process_started_at=vllm_handle.started_at,
+        on_ready=warmup_once,
+    )

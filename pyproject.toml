@@ -1,0 +1,9 @@
+[project]
+name = "modal-glm-5-3-flash-nota-nvfp4"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "huggingface-hub[hf-xet]>=2.0.0",
+    "modal[api-proxy-support]>=1.5.5",
+    "python-dotenv>=1.2.3",
+]
