@@ -57,6 +57,18 @@ step_016_prepare_model_mirror = importlib.import_module(
 step_017_run_generation_benchmark = importlib.import_module(
     "helpers.017_generation_benchmark"
 ).step_017_run_generation_benchmark
+startup_acceleration_module = importlib.import_module(
+    "helpers.018_startup_acceleration"
+)
+step_018_prepare_startup_plan_cache = (
+    startup_acceleration_module.step_018_prepare_startup_plan_cache
+)
+step_018_count_startup_plan_files = (
+    startup_acceleration_module.step_018_count_startup_plan_files
+)
+step_018_start_early_weight_prefetch = (
+    startup_acceleration_module.step_018_start_early_weight_prefetch
+)
 
 
 APP_NAME = os.getenv("GLM53_APP_NAME", "glm53-flash-nota-b300")
@@ -71,6 +83,10 @@ RUNTIME_IMAGE = "vllm/vllm-openai:glm53-flash"
 PROJECT_VOLUME_NAME = "modal-GLM-5.3-Flash-Nota-NVFP4"
 PROJECT_VOLUME_ROOT = "/project-volume"
 HF_CACHE = f"{PROJECT_VOLUME_ROOT}/glm53-flash-nota-hf-cache"
+VLLM_LOCAL_CACHE_ROOT = "/root/.cache/vllm"
+VLLM_STARTUP_PLAN_CACHE = (
+    f"{PROJECT_VOLUME_ROOT}/glm53-flash-nota-vllm-startup-plan"
+)
 FLASHINFER_AUTOTUNE_VERSION = "0.6.18"
 FLASHINFER_AUTOTUNE_ARCH = "103a"
 FLASHINFER_AUTOTUNE_CACHE = (
@@ -271,12 +287,24 @@ cache_image = (
 runtime_image = (
     modal.Image.from_registry(RUNTIME_IMAGE, add_python="3.12")
     .entrypoint([])
+    .run_commands(
+        "python3 -c \"from pathlib import Path; "
+        "p=Path('/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_worker.py'); "
+        "s=p.read_text(); "
+        "old='maybe_save_startup_plan(self, kv_cache_memory_bytes_to_requested_limit)'; "
+        "new='maybe_save_startup_plan(self, int(self.available_kv_cache_memory_bytes))'; "
+        "assert s.count(old)==1, f'unexpected startup-plan save call count: {s.count(old)}'; "
+        "p.write_text(s.replace(old,new)); "
+        "print('[IMAGE_PATCH] startup plan saves actual KV cache bytes')\""
+    )
     .env(
         {
             "CUDA_VISIBLE_DEVICES": "0",
             "HF_HOME": HF_CACHE,
             "HF_HUB_OFFLINE": "1",
             "VLLM_SERVER_DEV_MODE": "0",
+            "VLLM_CACHE_ROOT": VLLM_LOCAL_CACHE_ROOT,
+            "VLLM_ENABLE_STARTUP_PLAN": "1",
             "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": FLASHINFER_AUTOTUNE_RUNTIME_CACHE,
             "FLASHINFER_WORKSPACE_BASE": FLASHINFER_WORKSPACE_BASE,
             "TORCHINDUCTOR_COMPILE_THREADS": "1",
@@ -787,6 +815,36 @@ def _start_runtime_cache_sync(
     return thread
 
 
+def _start_startup_plan_commit() -> threading.Thread:
+    """首次生成 startup plan 后后台 commit Volume，不延长 API Ready 路径。"""
+
+    def run() -> None:
+        started_at = time.perf_counter()
+        print("[018_STARTUP_PLAN_COMMIT_START]", flush=True)
+        try:
+            project_volume.commit()
+        except Exception as exc:
+            print(
+                "[018_STARTUP_PLAN_COMMIT_FAILED] "
+                f"error={type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            return
+        print(
+            "[018_STARTUP_PLAN_COMMIT_DONE] "
+            f"elapsed_s={time.perf_counter() - started_at:.3f}",
+            flush=True,
+        )
+
+    thread = threading.Thread(
+        target=run,
+        name="startup-plan-volume-commit",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
 @app.cls(
     image=runtime_image,
     gpu="B300",
@@ -836,6 +894,16 @@ class VllmServer:
             destination=MODEL_RUNTIME_PATH,
         )
 
+        startup_plan_existed = step_018_prepare_startup_plan_cache(
+            local_cache_root=VLLM_LOCAL_CACHE_ROOT,
+            persistent_dir=VLLM_STARTUP_PLAN_CACHE,
+        )
+        self.early_weight_prefetch_thread = step_018_start_early_weight_prefetch(
+            model_path=model_path,
+            threads=PREFETCH_THREADS,
+            block_mib=PREFETCH_BLOCK_MIB,
+        )
+
         self.vllm_handle = step_003_start_vllm_with_model_init_observer(
             _build_vllm_command(model_path),
             extra_observer_factories=[
@@ -861,6 +929,25 @@ class VllmServer:
             api_ready_at=api_ready_at,
             repeats=3,
         )
+        if not startup_plan_existed:
+            startup_plan_files = step_018_count_startup_plan_files(
+                VLLM_STARTUP_PLAN_CACHE
+            )
+            if startup_plan_files:
+                self.startup_plan_commit_thread = _start_startup_plan_commit()
+                print(
+                    "[018_STARTUP_PLAN_CREATED] "
+                    f"files={startup_plan_files} path={VLLM_STARTUP_PLAN_CACHE}",
+                    flush=True,
+                )
+            else:
+                print(
+                    "[018_STARTUP_PLAN_MISSING] "
+                    f"path={VLLM_STARTUP_PLAN_CACHE}",
+                    flush=True,
+                )
+        else:
+            self.startup_plan_commit_thread = None
         if RUNTIME_CACHE_SYNC_ENABLED:
             self.cache_sync_thread = _start_runtime_cache_sync(
                 cache_sources,
