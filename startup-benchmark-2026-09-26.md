@@ -440,9 +440,11 @@ MTP5 acceptance：
 
 ---
 
-## 三层启动/缓存架构：GPU Snapshot → Modal Volume → GitHub Release
+## 历史方案：GPU Snapshot → Modal Volume → GitHub Release（已废弃）
 
-当前生产设计不是单一缓存，而是三层互补结构：
+以下内容仅保留 2026-09-26 的历史 benchmark。**2026-09-27 起生产路径已彻底移除 CPU/GPU Memory Snapshot、`/sleep?level=1` 与 `/wake_up`。当前架构为 Modal Volume runtime caches → 正常 vLLM 初始化，GitHub Release 仅作为 fallback。**
+
+历史设计曾采用三层互补结构：
 
 ```text
 第一层：GPU Memory Snapshot
@@ -460,9 +462,9 @@ snapshot 失效或不可用时帮助快速重新构建
 Modal Volume 缺失、新环境或灾备恢复时的 portable fallback
 ```
 
-### 第一层：Modal CPU + GPU Memory Snapshot
+### 第一层：Modal CPU + GPU Memory Snapshot（历史、已停用）
 
-生产 `VllmServer` 已配置：
+历史版本 `VllmServer` 曾配置：
 
 ```python
 enable_memory_snapshot=True
@@ -491,8 +493,7 @@ experimental_options={"enable_gpu_snapshot": True}
 - Snapshot **不是**保存在项目 Modal Volume 中。
 - Snapshot 由 Modal 平台内部管理，不会出现在 `modal volume list`。
 - 项目 Volume 只负责文件级持久缓存；Snapshot 是已初始化进程/显存状态的更高层恢复机制。
-- 当前代码已经启用 snapshot，且历史上已经真实跑通过 snapshot restore。
-- 每个新的 deployment / function revision 是否已有可用 snapshot，需要该 revision 至少成功完成一次 `snap=True` build；仅看到配置开启不能证明当前 revision 已经生成新 snapshot。
+- 当前代码已经不再启用 snapshot；下面的数据只用于保留过去的实验记录。
 
 历史实测：
 
