@@ -22,6 +22,54 @@ modal-GLM-5.3-Flash-Nota-NVFP4
 └── glm53-flash-nota-tilelang-cache/
 ```
 
+## 三层缓存 / 恢复架构
+
+```text
+第一层：GPU Memory Snapshot
+        ↓
+最快
+恢复已经初始化好的运行状态
+
+第二层：Modal Volume runtime caches
+        ↓
+FlashInfer / CUDA / Triton / HF weights...
+snapshot 失效时帮助快速重新构建
+
+第三层：GitHub Release
+        ↓
+Volume 丢失 / 新环境时的 portable fallback
+```
+
+当前状态：
+
+| 层 | 当前状态 | 说明 |
+|---|---|---|
+| GPU Memory Snapshot | ✅ 已启用；历史实测成功 | `enable_memory_snapshot=True` + `enable_gpu_snapshot=True`；历史 restore → API Ready 约 5.5 s。当前每个新 deployment revision 仍需至少成功完成一次 snapshot build 才能确认该 revision 已生成可用 snapshot。 |
+| Modal Volume runtime caches | ✅ 已启用且当前已有数据 | 单一项目 Volume：`modal-GLM-5.3-Flash-Nota-NVFP4`，承载 HF weights 和全部 runtime cache。 |
+| GitHub Release | ✅ 已启用且已有 5 个 assets | 作为 portable fallback；`flashinfer-jit` 目前因无有效 `.so/.o/.cubin` 尚未形成 asset。 |
+
+历史 Snapshot 实测：
+
+- 首次完整 snapshot build / prepare：约 **476.782 s**
+- vLLM `wake_up` 恢复 weights + KV：约 **5.457 s**
+- Snapshot restore → API Ready：约 **5.500 s**
+
+三层优先级：
+
+```text
+有有效 Snapshot
+→ restore + wake_up
+
+否则
+→ Modal Volume 恢复 HF + runtime caches
+→ 完整初始化
+→ 重新生成 Snapshot
+
+如果 Modal Volume 某 cache 缺失
+→ GitHub Release fallback
+→ 恢复后 commit 回 Modal Volume
+```
+
 ## 运行链路
 
 ```text

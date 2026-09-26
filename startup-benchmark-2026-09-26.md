@@ -437,3 +437,178 @@ MTP5 acceptance：
 额外观察：
 
 上一轮 `max_num_batched_tokens=1024` 时 vLLM 明确给出性能警告：在 MTP5 下 scheduled token budget 偏小，可能限制 speculative decoding 的最佳吞吐。正式配置已提高到 `8192`；该值也与当前 vLLM GLM-5.3 recipe 中 `max_num_seqs=16` 的已验证配置一致。
+
+---
+
+## 三层启动/缓存架构：GPU Snapshot → Modal Volume → GitHub Release
+
+当前生产设计不是单一缓存，而是三层互补结构：
+
+```text
+第一层：GPU Memory Snapshot
+        ↓
+最快
+恢复已经初始化好的 vLLM / 权重 / KV 运行状态
+
+第二层：Modal Volume runtime caches
+        ↓
+HF weights / FlashInfer / TileLang / Triton / TorchInductor / CUDA Compute
+snapshot 失效或不可用时帮助快速重新构建
+
+第三层：GitHub Release
+        ↓
+Modal Volume 缺失、新环境或灾备恢复时的 portable fallback
+```
+
+### 第一层：Modal CPU + GPU Memory Snapshot
+
+生产 `VllmServer` 已配置：
+
+```python
+enable_memory_snapshot=True
+experimental_options={"enable_gpu_snapshot": True}
+```
+
+生命周期：
+
+```text
+@modal.enter(snap=True)
+完整初始化 vLLM
+→ API Ready
+→ 16-token × 3 轻量 warmup
+→ /sleep?level=1
+→ 同步 runtime caches 到 Modal Volume
+→ Modal 保存 CPU/GPU Memory Snapshot
+
+@modal.enter(snap=False)
+后续新容器恢复 snapshot
+→ /wake_up
+→ API Ready
+```
+
+注意：
+
+- Snapshot **不是**保存在项目 Modal Volume 中。
+- Snapshot 由 Modal 平台内部管理，不会出现在 `modal volume list`。
+- 项目 Volume 只负责文件级持久缓存；Snapshot 是已初始化进程/显存状态的更高层恢复机制。
+- 当前代码已经启用 snapshot，且历史上已经真实跑通过 snapshot restore。
+- 每个新的 deployment / function revision 是否已有可用 snapshot，需要该 revision 至少成功完成一次 `snap=True` build；仅看到配置开启不能证明当前 revision 已经生成新 snapshot。
+
+历史实测：
+
+| Snapshot 指标 | 实测 |
+|---|---:|
+| 首次完整 snapshot build / prepare | 约 **476.782 s** |
+| vLLM `wake_up` 恢复 weights + KV | 约 **5.457 s** |
+| Snapshot restore → API Ready | 约 **5.500 s** |
+
+因此，在 snapshot 已存在且有效时，历史实测启动从完整 cold-build 的分钟级下降到约 **5.5 s**。
+
+### 第二层：Modal Volume runtime caches
+
+当前统一项目 Volume：
+
+```text
+modal-GLM-5.3-Flash-Nota-NVFP4/
+├── glm53-flash-nota-hf-cache/
+├── glm53-flash-nota-cuda-compute-cache/
+├── glm53-flash-nota-flashinfer-autotune/
+├── glm53-flash-nota-torchinductor-cache/
+├── glm53-flash-nota-flashinfer-jit/
+├── glm53-flash-nota-triton-cache/
+└── glm53-flash-nota-tilelang-cache/
+```
+
+运行产生的新 cache 会先安全持久化到 Modal Volume：
+
+```text
+B300 runtime
+→ runtime cache 产生/变化
+→ project_volume.commit()
+→ Modal Volume 成为 authoritative runtime cache
+→ 标记 .github-backup-dirty
+→ CPU backup worker 异步处理 GitHub
+```
+
+两类路径：
+
+1. 直接写项目 Volume：
+   - FlashInfer autotune
+   - FlashInfer JIT
+   - TileLang
+
+2. 先写容器本地 `/tmp/glm53-runtime-cache`，再归档同步到 Volume：
+   - Triton
+   - TorchInductor
+   - CUDA Compute
+
+因此即使 GitHub backup 失败，已经 `commit()` 的 cache 仍保存在 Modal Volume 中，不依赖 B300 容器继续存活。
+
+### 第三层：GitHub Release portable backup
+
+Repository：
+
+`xiaoqianran/modal-GLM-5.3-Flash-Nota-NVFP4`
+
+Release tag：
+
+`cache-b300-glm53-flash-nota-v1`
+
+当前已存在的 portable cache assets：
+
+| Asset | 当前大小 |
+|---|---:|
+| `flashinfer-autotune-0.6.18-b300.tar.gz` | 9,592 B |
+| `tilelang-b300.tar.gz` | 2,672,718 B |
+| `triton-b300.tar.gz` | 19,890,082 B |
+| `torchinductor-b300.tar.gz` | 479,783 B |
+| `cuda-compute-b300.tar.gz` | 194,429,984 B |
+
+`flashinfer-jit-0.6.18-b300.tar.gz` 当前尚不存在，因为项目 Volume 中还没有满足 `*.so / *.o / *.cubin` 条件的有效 JIT binary；一旦出现并发生 fingerprint 变化，会被标记 dirty 并交给 CPU backup worker 发布。
+
+常规 deploy 的第 `[7/7]` 步已经改为增量：
+
+```text
+backup_runtime_caches
+→ dirty / missing 才重新打包上传
+→ GitHub 已存在且无变化：RELEASE_HIT
+→ 不再每次 force 全量重传
+```
+
+2026-09-27 实测一次无变化的增量检查：
+
+- 总耗时：**7.189 s**
+- 重新打包：0
+- 重新上传：0
+- FlashInfer autotune：RELEASE_HIT
+- TileLang：RELEASE_HIT
+- Triton：RELEASE_HIT
+- TorchInductor：RELEASE_HIT
+- CUDA Compute：RELEASE_HIT
+- FlashInfer JIT：SKIP / cache_not_ready
+
+### 故障恢复优先级
+
+```text
+1. 有有效 GPU Snapshot
+   → restore + wake_up
+   → 历史实测约 5.5 s API Ready
+
+2. Snapshot 不存在 / 失效
+   → 从 Modal Volume 读取 HF + runtime caches
+   → 完整初始化
+   → 生成新的 snapshot
+
+3. Modal Volume 中某 cache 缺失
+   → GitHub Release fallback 恢复
+   → commit 回 Modal Volume
+   → 再进入正常启动
+```
+
+三层职责：
+
+- **GPU Snapshot**：启动速度层。
+- **Modal Volume**：运行时持久化主存储 / authoritative cache。
+- **GitHub Release**：可移植备份与灾备 fallback。
+
+三层不是重复存储，而是分别解决“极速恢复 / 稳定持久化 / 跨环境灾备”三个问题。
