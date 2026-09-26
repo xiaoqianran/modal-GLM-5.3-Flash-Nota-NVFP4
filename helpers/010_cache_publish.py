@@ -9,6 +9,7 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 
 cache_restore = importlib.import_module("helpers.009_cache_restore")
@@ -22,7 +23,7 @@ def _create_archive(source: Path, destination: Path) -> None:
     # Runtime caches are mostly compiled binaries; level 1 avoids wasting CPU on marginal compression.
     with tarfile.open(destination, "w:gz", compresslevel=1) as tar:
         for item in sorted(source.iterdir()):
-            if item.name == ".staged-cache-dirty":
+            if item.name in {".staged-cache-dirty", ".github-backup-dirty"}:
                 continue
             tar.add(item, arcname=item.name, recursive=True)
 
@@ -69,7 +70,7 @@ def _upload_asset_streaming(
     asset_name: str,
     archive: Path,
     token: str,
-) -> None:
+) -> dict:
     parsed = urllib.parse.urlparse(upload_url)
     query = urllib.parse.urlencode({"name": asset_name})
     target = f"{parsed.path}?{query}"
@@ -81,7 +82,11 @@ def _upload_asset_streaming(
         "User-Agent": "modal-glm53-cache-manager",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    connection = http.client.HTTPSConnection(parsed.hostname, parsed.port or 443, timeout=600)
+    connection = http.client.HTTPSConnection(
+        parsed.hostname,
+        parsed.port or 443,
+        timeout=1800,
+    )
     try:
         connection.putrequest("POST", target)
         for key, value in headers.items():
@@ -96,8 +101,32 @@ def _upload_asset_streaming(
             raise RuntimeError(
                 f"GitHub asset upload failed: status={response.status} body={body[:512]!r}"
             )
+        return json.loads(body.decode("utf-8"))
     finally:
         connection.close()
+
+
+def _rename_asset(*, asset_url: str, name: str, token: str) -> dict:
+    payload = json.dumps({"name": name}).encode("utf-8")
+    return _read_json(
+        _github_request(
+            asset_url,
+            method="PATCH",
+            token=token,
+            data=payload,
+            content_type="application/json",
+        )
+    )
+
+
+def _delete_asset(*, asset_url: str, token: str) -> None:
+    request = _github_request(
+        asset_url,
+        method="DELETE",
+        token=token,
+    )
+    with urllib.request.urlopen(request, timeout=60):
+        pass
 
 
 def step_010_publish_cache(
@@ -129,36 +158,87 @@ def step_010_publish_cache(
         token=token,
     )
 
-    for asset in release.get("assets", []):
-        if asset.get("name") != artifact.release_asset:
-            continue
-        if not replace_existing:
-            print(
-                f"[010_CACHE_RELEASE_HIT] name={artifact.name} "
-                f"asset={artifact.release_asset}",
-                flush=True,
-            )
-            return True
-        delete_request = _github_request(
-            asset["url"],
-            method="DELETE",
-            token=token,
+    existing_asset = next(
+        (
+            asset
+            for asset in release.get("assets", [])
+            if asset.get("name") == artifact.release_asset
+        ),
+        None,
+    )
+    if existing_asset is not None and not replace_existing:
+        print(
+            f"[010_CACHE_RELEASE_HIT] name={artifact.name} "
+            f"asset={artifact.release_asset}",
+            flush=True,
         )
-        with urllib.request.urlopen(delete_request, timeout=60):
-            pass
-        break
+        return True
 
     source = Path(artifact.local_path)
     with tempfile.TemporaryDirectory(prefix="glm53-cache-publish-") as temp_dir:
         archive = Path(temp_dir) / artifact.release_asset
         _create_archive(source, archive)
         upload_url = release["upload_url"].split("{", 1)[0]
-        _upload_asset_streaming(
-            upload_url=upload_url,
-            asset_name=artifact.release_asset,
-            archive=archive,
-            token=token,
-        )
+        if existing_asset is None:
+            _upload_asset_streaming(
+                upload_url=upload_url,
+                asset_name=artifact.release_asset,
+                archive=archive,
+                token=token,
+            )
+        else:
+            suffix = uuid.uuid4().hex[:12]
+            uploading_name = f"{artifact.release_asset}.uploading-{suffix}"
+            previous_name = f"{artifact.release_asset}.previous-{suffix}"
+            uploaded_asset = _upload_asset_streaming(
+                upload_url=upload_url,
+                asset_name=uploading_name,
+                archive=archive,
+                token=token,
+            )
+            previous_renamed = False
+            try:
+                _rename_asset(
+                    asset_url=existing_asset["url"],
+                    name=previous_name,
+                    token=token,
+                )
+                previous_renamed = True
+                _rename_asset(
+                    asset_url=uploaded_asset["url"],
+                    name=artifact.release_asset,
+                    token=token,
+                )
+            except Exception:
+                if previous_renamed:
+                    try:
+                        _rename_asset(
+                            asset_url=existing_asset["url"],
+                            name=artifact.release_asset,
+                            token=token,
+                        )
+                    except Exception:
+                        pass
+                try:
+                    _delete_asset(
+                        asset_url=uploaded_asset["url"],
+                        token=token,
+                    )
+                except Exception:
+                    pass
+                raise
+
+            try:
+                _delete_asset(
+                    asset_url=existing_asset["url"],
+                    token=token,
+                )
+            except Exception as exc:
+                print(
+                    "[010_CACHE_PREVIOUS_DELETE_FAILED] "
+                    f"name={artifact.name} error={type(exc).__name__}",
+                    flush=True,
+                )
 
     print(
         f"[010_CACHE_PUBLISHED] name={artifact.name} asset={artifact.release_asset}",

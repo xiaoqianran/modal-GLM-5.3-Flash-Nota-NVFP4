@@ -32,9 +32,6 @@ cache_restore_module = importlib.import_module("helpers.009_cache_restore")
 CacheArtifact = cache_restore_module.CacheArtifact
 cache_fingerprint = cache_restore_module.cache_fingerprint
 step_009_restore_cache = cache_restore_module.step_009_restore_cache
-step_010_publish_cache = importlib.import_module(
-    "helpers.010_cache_publish"
-).step_010_publish_cache
 step_011_discover_runtime_caches = importlib.import_module(
     "helpers.011_cache_discovery"
 ).step_011_discover_runtime_caches
@@ -42,11 +39,12 @@ cache_staging_module = importlib.import_module("helpers.012_cache_staging")
 step_012_stage_cache = cache_staging_module.step_012_stage_cache
 step_012_sync_cache = cache_staging_module.step_012_sync_cache
 step_012_cache_dirty = cache_staging_module.step_012_cache_dirty
-step_012_clear_dirty = cache_staging_module.step_012_clear_dirty
 archive_staging_module = importlib.import_module("helpers.013_stage_archive")
 step_013_stage_archive = archive_staging_module.step_013_stage_archive
 step_013_sync_archive = archive_staging_module.step_013_sync_archive
 step_013_compact_legacy_seed = archive_staging_module.step_013_compact_legacy_seed
+cache_backup_state = importlib.import_module("helpers.015_cache_backup_state")
+mark_cache_backup_dirty = cache_backup_state.mark_cache_backup_dirty
 
 
 APP_NAME = os.getenv("GLM53_APP_NAME", "glm53-flash-nota-b300")
@@ -77,6 +75,8 @@ CUDA_COMPUTE_VOLUME_NAME = "glm53-flash-nota-cuda-compute-cache"
 
 GITHUB_REPO = "xiaoqianran/modal-GLM-5.3-Flash-Nota-NVFP4"
 CACHE_RELEASE_TAG = "cache-b300-glm53-flash-nota-v1"
+CACHE_BACKUP_APP_NAME = "glm53-cache-backup"
+CACHE_BACKUP_FUNCTION_NAME = "backup_runtime_caches"
 RUNTIME_CACHE_ARTIFACTS = (
     CacheArtifact(
         name="flashinfer-autotune",
@@ -256,28 +256,27 @@ def _restore_runtime_caches() -> dict[str, str]:
     return _restore_cache_artifacts(ALL_CACHE_ARTIFACTS)
 
 
-def _publish_runtime_caches() -> dict[str, bool]:
-    results: dict[str, bool] = {}
-    for artifact in ALL_CACHE_ARTIFACTS:
-        staged_dirty = (
-            artifact.name in STAGED_CACHE_NAMES
-            and step_012_cache_dirty(artifact.local_path)
+def _spawn_cache_backup() -> None:
+    """Volume commit 后，把 GitHub 备份交给独立 CPU App。"""
+    try:
+        backup_function = modal.Function.from_name(
+            CACHE_BACKUP_APP_NAME,
+            CACHE_BACKUP_FUNCTION_NAME,
         )
-        published = step_010_publish_cache(
-            artifact,
-            github_repo=GITHUB_REPO,
-            release_tag=CACHE_RELEASE_TAG,
-            replace_existing=staged_dirty,
+        backup_function.spawn()
+        print(
+            "[CACHE_BACKUP_SPAWNED] "
+            f"app={CACHE_BACKUP_APP_NAME} "
+            f"function={CACHE_BACKUP_FUNCTION_NAME}",
+            flush=True,
         )
-        results[artifact.name] = published
-        if published and staged_dirty:
-            step_012_clear_dirty(artifact.local_path)
-            cache_volumes[artifact.name].commit()
-            print(
-                f"[012_CACHE_DIRTY_CLEARED] name={artifact.name}",
-                flush=True,
-            )
-    return results
+    except Exception as exc:
+        print(
+            "[CACHE_BACKUP_SPAWN_FAILED] "
+            f"app={CACHE_BACKUP_APP_NAME} "
+            f"error={type(exc).__name__}: {exc}",
+            flush=True,
+        )
 
 
 @app.function(
@@ -291,19 +290,6 @@ def _publish_runtime_caches() -> dict[str, bool]:
 def step_009_restore_runtime_caches():
     """CPU 阶段：Volume 优先，缺失时从 GitHub Release 恢复运行时缓存。"""
     return _restore_runtime_caches()
-
-
-@app.function(
-    image=cache_image,
-    cpu=1,
-    memory=2048,
-    timeout=1800,
-    secrets=[github_secret],
-    volumes=cache_mounts,
-)
-def step_010_publish_runtime_caches():
-    """CPU 阶段：确保当前可移植缓存已有 GitHub Release 备份。"""
-    return _publish_runtime_caches()
 
 
 @app.function(
@@ -497,7 +483,7 @@ def serve():
         for artifact in STAGED_CACHE_ARTIFACTS:
             runtime_path = STAGED_CACHE_RUNTIME_PATHS[artifact.name]
             if artifact.name in ARCHIVED_STAGED_CACHE_NAMES:
-                step_013_sync_archive(
+                changed = step_013_sync_archive(
                     runtime_path,
                     artifact.local_path,
                     name=artifact.name,
@@ -508,45 +494,45 @@ def serve():
                     artifact.local_path,
                     name=artifact.name,
                 )
+                changed = step_012_cache_dirty(artifact.local_path)
+            if changed:
+                mark_cache_backup_dirty(artifact.local_path)
             cache_volumes[artifact.name].commit()
             print(
                 f"[RUNTIME_CACHE_COMMIT] name={artifact.name} path={artifact.local_path}",
+                flush=True,
+            )
+            print(
+                "[CACHE_VOLUME_SAFE] "
+                f"name={artifact.name} changed={str(changed).lower()}",
                 flush=True,
             )
 
         for artifact in RUNTIME_CACHE_ARTIFACTS:
-            cache_volumes[artifact.name].commit()
-            print(
-                f"[RUNTIME_CACHE_COMMIT] name={artifact.name} path={artifact.local_path}",
-                flush=True,
-            )
-
             before = cache_fingerprints_before.get(artifact.name, ())
             after = cache_fingerprint(artifact)
             changed = before != after
             if changed:
+                mark_cache_backup_dirty(artifact.local_path)
                 print(
                     f"[RUNTIME_CACHE_CHANGED] name={artifact.name} "
                     f"before_files={len(before)} after_files={len(after)}",
                     flush=True,
                 )
 
-            if not changed and cache_sources.get(artifact.name) != "miss":
-                continue
-            try:
-                step_010_publish_cache(
-                    artifact,
-                    github_repo=GITHUB_REPO,
-                    release_tag=CACHE_RELEASE_TAG,
-                    replace_existing=changed,
-                )
-            except Exception as exc:
-                print(
-                    "[010_CACHE_PUBLISH_FAILED] "
-                    f"name={artifact.name} error={type(exc).__name__}",
-                    flush=True,
-                )
+            cache_volumes[artifact.name].commit()
+            print(
+                f"[RUNTIME_CACHE_COMMIT] name={artifact.name} path={artifact.local_path}",
+                flush=True,
+            )
+            print(
+                "[CACHE_VOLUME_SAFE] "
+                f"name={artifact.name} changed={str(changed).lower()} "
+                f"source={cache_sources.get(artifact.name, 'unknown')}",
+                flush=True,
+            )
 
+        _spawn_cache_backup()
         step_011_discover_runtime_caches()
 
     # 007/008：HTTP 200 确认 API Ready 后，立即执行最小真实 generation。
