@@ -41,6 +41,8 @@ step_011_discover_runtime_caches = importlib.import_module(
 cache_staging_module = importlib.import_module("helpers.012_cache_staging")
 step_012_stage_cache = cache_staging_module.step_012_stage_cache
 step_012_sync_cache = cache_staging_module.step_012_sync_cache
+step_012_cache_dirty = cache_staging_module.step_012_cache_dirty
+step_012_clear_dirty = cache_staging_module.step_012_clear_dirty
 
 
 APP_NAME = os.getenv("GLM53_APP_NAME", "glm53-flash-nota-b300")
@@ -55,9 +57,16 @@ FLASHINFER_JIT_CACHE = "/root/.cache/flashinfer"
 FLASHINFER_JIT_VOLUME_NAME = "glm53-flash-nota-flashinfer-jit"
 TILELANG_CACHE = "/root/.tilelang/cache"
 TILELANG_VOLUME_NAME = "glm53-flash-nota-tilelang-cache"
-TRITON_CACHE = "/root/.triton/cache"
+STAGED_CACHE_ROOT = "/tmp/glm53-runtime-cache"
+TRITON_CACHE = f"{STAGED_CACHE_ROOT}/triton"
 TRITON_CACHE_SEED = "/cache-seeds/triton"
 TRITON_VOLUME_NAME = "glm53-flash-nota-triton-cache"
+TORCHINDUCTOR_CACHE = f"{STAGED_CACHE_ROOT}/torchinductor"
+TORCHINDUCTOR_CACHE_SEED = "/cache-seeds/torchinductor"
+TORCHINDUCTOR_VOLUME_NAME = "glm53-flash-nota-torchinductor-cache"
+CUDA_COMPUTE_CACHE = f"{STAGED_CACHE_ROOT}/cuda-compute"
+CUDA_COMPUTE_CACHE_SEED = "/cache-seeds/cuda-compute"
+CUDA_COMPUTE_VOLUME_NAME = "glm53-flash-nota-cuda-compute-cache"
 
 GITHUB_REPO = "xiaoqianran/modal-GLM-5.3-Flash-Nota-NVFP4"
 CACHE_RELEASE_TAG = "cache-b300-glm53-flash-nota-v1"
@@ -93,7 +102,27 @@ STAGED_CACHE_ARTIFACTS = (
         release_asset="triton-b300.tar.gz",
         required_globs=("**/*.autotune.json", "**/*.cubin", "**/*.so", "**/*.json"),
     ),
+    CacheArtifact(
+        name="torchinductor",
+        local_path=TORCHINDUCTOR_CACHE_SEED,
+        volume_name=TORCHINDUCTOR_VOLUME_NAME,
+        release_asset="torchinductor-b300.tar.gz",
+        required_globs=("**/*.cubin", "**/*.so", "**/*.json", "**/*.ptx", "**/*.ttir"),
+    ),
+    CacheArtifact(
+        name="cuda-compute",
+        local_path=CUDA_COMPUTE_CACHE_SEED,
+        volume_name=CUDA_COMPUTE_VOLUME_NAME,
+        release_asset="cuda-compute-b300.tar.gz",
+        required_globs=("**/*",),
+    ),
 )
+STAGED_CACHE_RUNTIME_PATHS = {
+    "triton": TRITON_CACHE,
+    "torchinductor": TORCHINDUCTOR_CACHE,
+    "cuda-compute": CUDA_COMPUTE_CACHE,
+}
+STAGED_CACHE_NAMES = frozenset(STAGED_CACHE_RUNTIME_PATHS)
 ALL_CACHE_ARTIFACTS = RUNTIME_CACHE_ARTIFACTS + STAGED_CACHE_ARTIFACTS
 
 MAX_B300_CONTAINERS = 1
@@ -162,6 +191,8 @@ runtime_image = (
             "TILELANG_CACHE_DIR": TILELANG_CACHE,
             "TRITON_CACHE_DIR": TRITON_CACHE,
             "TRITON_CACHE_AUTOTUNING": "1",
+            "TORCHINDUCTOR_CACHE_DIR": TORCHINDUCTOR_CACHE,
+            "CUDA_CACHE_PATH": CUDA_COMPUTE_CACHE,
         }
     )
     .add_local_dir("helpers", "/root/helpers")
@@ -204,11 +235,24 @@ def _restore_runtime_caches() -> dict[str, str]:
 def _publish_runtime_caches() -> dict[str, bool]:
     results: dict[str, bool] = {}
     for artifact in ALL_CACHE_ARTIFACTS:
-        results[artifact.name] = step_010_publish_cache(
+        staged_dirty = (
+            artifact.name in STAGED_CACHE_NAMES
+            and step_012_cache_dirty(artifact.local_path)
+        )
+        published = step_010_publish_cache(
             artifact,
             github_repo=GITHUB_REPO,
             release_tag=CACHE_RELEASE_TAG,
+            replace_existing=staged_dirty,
         )
+        results[artifact.name] = published
+        if published and staged_dirty:
+            step_012_clear_dirty(artifact.local_path)
+            cache_volumes[artifact.name].commit()
+            print(
+                f"[012_CACHE_DIRTY_CLEARED] name={artifact.name}",
+                flush=True,
+            )
     return results
 
 
@@ -228,8 +272,8 @@ def step_009_restore_runtime_caches():
 @app.function(
     image=cache_image,
     cpu=1,
-    memory=1024,
-    timeout=900,
+    memory=2048,
+    timeout=1800,
     secrets=[github_secret],
     volumes=cache_mounts,
 )
@@ -287,11 +331,12 @@ def serve():
         artifact.name: cache_fingerprint(artifact)
         for artifact in ALL_CACHE_ARTIFACTS
     }
-    step_012_stage_cache(
-        TRITON_CACHE_SEED,
-        TRITON_CACHE,
-        name="triton",
-    )
+    for artifact in STAGED_CACHE_ARTIFACTS:
+        step_012_stage_cache(
+            artifact.local_path,
+            STAGED_CACHE_RUNTIME_PATHS[artifact.name],
+            name=artifact.name,
+        )
 
     strategy = os.environ.get(
         "GLM53_LOAD_STRATEGY",
@@ -372,11 +417,12 @@ def serve():
             process_started_at=vllm_handle.started_at,
             api_ready_at=api_ready_at,
         )
-        step_012_sync_cache(
-            TRITON_CACHE,
-            TRITON_CACHE_SEED,
-            name="triton",
-        )
+        for artifact in STAGED_CACHE_ARTIFACTS:
+            step_012_sync_cache(
+                STAGED_CACHE_RUNTIME_PATHS[artifact.name],
+                artifact.local_path,
+                name=artifact.name,
+            )
 
         for artifact in ALL_CACHE_ARTIFACTS:
             cache_volumes[artifact.name].commit()
@@ -395,6 +441,9 @@ def serve():
                     flush=True,
                 )
 
+            if artifact.name in STAGED_CACHE_NAMES:
+                # Large staged caches are uploaded by the CPU cache job, never by the B300 process.
+                continue
             if not changed and cache_sources.get(artifact.name) != "miss":
                 continue
             try:

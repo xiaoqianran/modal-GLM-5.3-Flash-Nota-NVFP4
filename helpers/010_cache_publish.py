@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import importlib
 import json
 import os
@@ -18,7 +19,8 @@ _read_json = cache_restore._read_json
 
 
 def _create_archive(source: Path, destination: Path) -> None:
-    with tarfile.open(destination, "w:gz") as tar:
+    # Runtime caches are mostly compiled binaries; level 1 avoids wasting CPU on marginal compression.
+    with tarfile.open(destination, "w:gz", compresslevel=1) as tar:
         for item in sorted(source.iterdir()):
             tar.add(item, arcname=item.name, recursive=True)
 
@@ -57,6 +59,43 @@ def _get_or_create_release(
             content_type="application/json",
         )
     )
+
+
+def _upload_asset_streaming(
+    *,
+    upload_url: str,
+    asset_name: str,
+    archive: Path,
+    token: str,
+) -> None:
+    parsed = urllib.parse.urlparse(upload_url)
+    query = urllib.parse.urlencode({"name": asset_name})
+    target = f"{parsed.path}?{query}"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/gzip",
+        "Content-Length": str(archive.stat().st_size),
+        "User-Agent": "modal-glm53-cache-manager",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    connection = http.client.HTTPSConnection(parsed.hostname, parsed.port or 443, timeout=600)
+    try:
+        connection.putrequest("POST", target)
+        for key, value in headers.items():
+            connection.putheader(key, value)
+        connection.endheaders()
+        with archive.open("rb") as source:
+            while chunk := source.read(8 * 1024 * 1024):
+                connection.send(chunk)
+        response = connection.getresponse()
+        body = response.read()
+        if response.status < 200 or response.status >= 300:
+            raise RuntimeError(
+                f"GitHub asset upload failed: status={response.status} body={body[:512]!r}"
+            )
+    finally:
+        connection.close()
 
 
 def step_010_publish_cache(
@@ -112,16 +151,12 @@ def step_010_publish_cache(
         archive = Path(temp_dir) / artifact.release_asset
         _create_archive(source, archive)
         upload_url = release["upload_url"].split("{", 1)[0]
-        query = urllib.parse.urlencode({"name": artifact.release_asset})
-        request = _github_request(
-            f"{upload_url}?{query}",
-            method="POST",
+        _upload_asset_streaming(
+            upload_url=upload_url,
+            asset_name=artifact.release_asset,
+            archive=archive,
             token=token,
-            data=archive.read_bytes(),
-            content_type="application/gzip",
         )
-        with urllib.request.urlopen(request, timeout=600) as response:
-            response.read()
 
     print(
         f"[010_CACHE_PUBLISHED] name={artifact.name} asset={artifact.release_asset}",
