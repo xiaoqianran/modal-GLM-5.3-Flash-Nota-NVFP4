@@ -107,7 +107,7 @@ STAGED_CACHE_ARTIFACTS = (
         local_path=TORCHINDUCTOR_CACHE_SEED,
         volume_name=TORCHINDUCTOR_VOLUME_NAME,
         release_asset="torchinductor-b300.tar.gz",
-        required_globs=("**/*.cubin", "**/*.so", "**/*.json", "**/*.ptx", "**/*.ttir"),
+        required_globs=("**/*.cubin", "**/*.so", "**/*.json", "**/*.ptx", "**/*.ttir", "**/*.py", "**/*.best_config"),
     ),
     CacheArtifact(
         name="cuda-compute",
