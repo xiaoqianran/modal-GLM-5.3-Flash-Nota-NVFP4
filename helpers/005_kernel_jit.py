@@ -18,6 +18,15 @@ _CACHE_DIR_RE = re.compile(
     r"Using cache directory:\s*(.+?)\s+for vLLM's torch\.compile",
     re.IGNORECASE,
 )
+_FLASHINFER_CACHE_FILE_RE = re.compile(
+    r"Using FlashInfer autotune cache file:\s*(.+)",
+    re.IGNORECASE,
+)
+_FLASHINFER_SAVE_RE = re.compile(
+    r"Saved\s+(\d+)\s+configs.*?\((\d+)\s+new,\s+"
+    r"(\d+)\s+from previous config\)",
+    re.IGNORECASE,
+)
 
 _KERNEL_BACKENDS = {
     "tilelang": "TileLang",
@@ -42,6 +51,7 @@ class _KernelJITObserver:
         self.graph_compile_s: list[float] = []
         self.compile_cache_dir: str | None = None
         self.compile_cache_hit = False
+        self.flashinfer_cache_file: str | None = None
         self.seen_kernel_events: set[str] = set()
         self.done = False
 
@@ -77,6 +87,30 @@ class _KernelJITObserver:
         lowered = line.lower()
 
         self._observe_kernel_event(line, now)
+
+        flashinfer_cache_match = _FLASHINFER_CACHE_FILE_RE.search(line)
+        if flashinfer_cache_match:
+            self.flashinfer_cache_file = flashinfer_cache_match.group(1).strip()
+            print(
+                "[005_FLASHINFER_CACHE_FILE] "
+                f"path={self.flashinfer_cache_file}",
+                flush=True,
+            )
+
+        flashinfer_save_match = _FLASHINFER_SAVE_RE.search(line)
+        if flashinfer_save_match:
+            total_configs = int(flashinfer_save_match.group(1))
+            new_configs = int(flashinfer_save_match.group(2))
+            previous_configs = int(flashinfer_save_match.group(3))
+            print(
+                "[005_FLASHINFER_AUTOTUNE_DONE] "
+                f"total_configs={total_configs} "
+                f"new_configs={new_configs} "
+                f"previous_configs={previous_configs} "
+                f"actual_cache_hit={str(previous_configs > 0).lower()} "
+                f"from_process_start_s={now - self.process_started_at:.3f}",
+                flush=True,
+            )
 
         cache_match = _CACHE_DIR_RE.search(line)
         if cache_match:

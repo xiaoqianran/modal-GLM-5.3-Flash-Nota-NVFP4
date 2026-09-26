@@ -101,7 +101,7 @@ def step_009_restore_cache(
 ) -> str:
     """优先使用 Modal Volume；缺失时再从 GitHub Release 恢复缓存。"""
     if _cache_ready(artifact):
-        print(f"[009_CACHE_VOLUME_HIT] name={artifact.name}", flush=True)
+        print(f"[009_CACHE_VOLUME_SEED] name={artifact.name}", flush=True)
         return "modal"
 
     token = os.environ.get("GITHUB_TOKEN", "").strip()
