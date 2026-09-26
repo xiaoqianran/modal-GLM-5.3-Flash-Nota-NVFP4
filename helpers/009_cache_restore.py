@@ -20,7 +20,7 @@ class CacheArtifact:
     local_path: str
     volume_name: str
     release_asset: str
-    required_glob: str
+    required_globs: tuple[str, ...]
 
 
 def _github_request(
@@ -49,12 +49,17 @@ def _read_json(request: urllib.request.Request) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
-def _path_has_required(root: Path, required_glob: str) -> bool:
-    return root.exists() and any(root.glob(required_glob))
+def _path_has_required(root: Path, required_globs: tuple[str, ...]) -> bool:
+    if not root.exists():
+        return False
+    return any(
+        any(path.is_file() for path in root.glob(pattern))
+        for pattern in required_globs
+    )
 
 
 def _cache_ready(artifact: CacheArtifact) -> bool:
-    return _path_has_required(Path(artifact.local_path), artifact.required_glob)
+    return _path_has_required(Path(artifact.local_path), artifact.required_globs)
 
 
 def _safe_extract(archive: Path, destination: Path) -> None:
@@ -123,7 +128,7 @@ def step_009_restore_cache(
                     shutil.copyfileobj(response, output)
             _safe_extract(archive, extracted)
 
-            if not _path_has_required(extracted, artifact.required_glob):
+            if not _path_has_required(extracted, artifact.required_globs):
                 raise RuntimeError("downloaded archive failed cache validation")
 
             destination = Path(artifact.local_path)

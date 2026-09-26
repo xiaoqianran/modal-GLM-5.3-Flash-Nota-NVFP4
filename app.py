@@ -34,6 +34,9 @@ step_009_restore_cache = cache_restore_module.step_009_restore_cache
 step_010_publish_cache = importlib.import_module(
     "helpers.010_cache_publish"
 ).step_010_publish_cache
+step_011_discover_runtime_caches = importlib.import_module(
+    "helpers.011_cache_discovery"
+).step_011_discover_runtime_caches
 
 
 APP_NAME = os.getenv("GLM53_APP_NAME", "glm53-flash-nota-b300")
@@ -44,6 +47,10 @@ HF_CACHE = "/root/.cache/huggingface"
 HF_VOLUME_NAME = "glm53-flash-nota-hf-cache"
 FLASHINFER_AUTOTUNE_CACHE = "/root/.cache/vllm/flashinfer_autotune_cache"
 FLASHINFER_AUTOTUNE_VOLUME_NAME = "glm53-flash-nota-flashinfer-autotune"
+FLASHINFER_JIT_CACHE = "/root/.cache/flashinfer"
+FLASHINFER_JIT_VOLUME_NAME = "glm53-flash-nota-flashinfer-jit"
+TILELANG_CACHE = "/root/.tilelang/cache"
+TILELANG_VOLUME_NAME = "glm53-flash-nota-tilelang-cache"
 
 GITHUB_REPO = "xiaoqianran/modal-GLM-5.3-Flash-Nota-NVFP4"
 CACHE_RELEASE_TAG = "cache-b300-glm53-flash-nota-v1"
@@ -53,7 +60,21 @@ RUNTIME_CACHE_ARTIFACTS = (
         local_path=FLASHINFER_AUTOTUNE_CACHE,
         volume_name=FLASHINFER_AUTOTUNE_VOLUME_NAME,
         release_asset="flashinfer-autotune-0.6.18-b300.tar.gz",
-        required_glob="**/autotune_configs.json",
+        required_globs=("**/autotune_configs.json",),
+    ),
+    CacheArtifact(
+        name="flashinfer-jit",
+        local_path=FLASHINFER_JIT_CACHE,
+        volume_name=FLASHINFER_JIT_VOLUME_NAME,
+        release_asset="flashinfer-jit-0.6.18-b300.tar.gz",
+        required_globs=("**/*.so", "**/*.o", "**/*.cubin"),
+    ),
+    CacheArtifact(
+        name="tilelang",
+        local_path=TILELANG_CACHE,
+        volume_name=TILELANG_VOLUME_NAME,
+        release_asset="tilelang-b300.tar.gz",
+        required_globs=("**/*.so", "**/*.cubin", "**/best_config.json"),
     ),
 )
 
@@ -120,6 +141,7 @@ runtime_image = (
             "GLM53_LOAD_STRATEGY": LOAD_STRATEGY,
             "GLM53_PREFETCH_THREADS": str(PREFETCH_THREADS),
             "GLM53_PREFETCH_BLOCK_MIB": str(PREFETCH_BLOCK_MIB),
+            "TILELANG_CACHE_DIR": TILELANG_CACHE,
         }
     )
     .add_local_dir("helpers", "/root/helpers")
@@ -315,7 +337,13 @@ def serve():
     )
 
     def warmup_once(api_ready_at: float) -> None:
-        """008：API Ready 后执行一次最小真实 generation warmup。"""
+        """008：API Ready 后执行真实 warmup，再固化并发现运行时缓存。"""
+        step_008_run_warmup(
+            model=MODEL,
+            process_started_at=vllm_handle.started_at,
+            api_ready_at=api_ready_at,
+        )
+
         for artifact in RUNTIME_CACHE_ARTIFACTS:
             runtime_cache_volumes[artifact.name].commit()
             print(
@@ -336,11 +364,8 @@ def serve():
                     f"name={artifact.name} error={type(exc).__name__}",
                     flush=True,
                 )
-        step_008_run_warmup(
-            model=MODEL,
-            process_started_at=vllm_handle.started_at,
-            api_ready_at=api_ready_at,
-        )
+
+        step_011_discover_runtime_caches()
 
     # 007/008：HTTP 200 确认 API Ready 后，立即执行最小真实 generation。
     step_007_start_api_ready_observer(
