@@ -66,9 +66,6 @@ step_018_prepare_startup_plan_cache = (
 step_018_count_startup_plan_files = (
     startup_acceleration_module.step_018_count_startup_plan_files
 )
-step_018_start_early_weight_prefetch = (
-    startup_acceleration_module.step_018_start_early_weight_prefetch
-)
 
 
 APP_NAME = os.getenv("GLM53_APP_NAME", "glm53-flash-nota-b300")
@@ -287,7 +284,13 @@ cache_image = (
 runtime_image = (
     modal.Image.from_registry(RUNTIME_IMAGE, add_python="3.12")
     .entrypoint([])
+    .add_local_file(
+        "helpers/019_patch_vllm_prefetch.py",
+        "/tmp/019_patch_vllm_prefetch.py",
+        copy=True,
+    )
     .run_commands(
+        "python3 /tmp/019_patch_vllm_prefetch.py",
         "python3 -c \"from pathlib import Path; "
         "p=Path('/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_worker.py'); "
         "s=p.read_text(); "
@@ -897,11 +900,6 @@ class VllmServer:
         startup_plan_existed = step_018_prepare_startup_plan_cache(
             local_cache_root=VLLM_LOCAL_CACHE_ROOT,
             persistent_dir=VLLM_STARTUP_PLAN_CACHE,
-        )
-        self.early_weight_prefetch_thread = step_018_start_early_weight_prefetch(
-            model_path=model_path,
-            threads=PREFETCH_THREADS,
-            block_mib=PREFETCH_BLOCK_MIB,
         )
 
         self.vllm_handle = step_003_start_vllm_with_model_init_observer(
