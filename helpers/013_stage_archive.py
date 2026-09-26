@@ -24,6 +24,7 @@ def _tree_manifest(
     *,
     archive_name: str = ARCHIVE_NAME,
 ) -> tuple[str, int, int]:
+    """基于相对路径和文件内容生成稳定指纹，不依赖 mtime。"""
     digest = hashlib.sha256()
     files = 0
     total_bytes = 0
@@ -31,23 +32,31 @@ def _tree_manifest(
         return digest.hexdigest(), files, total_bytes
 
     reserved = _reserved_names(archive_name)
-    records: list[tuple[str, int, int]] = []
-    for path in root.rglob("*"):
-        if not path.is_file() or path.name in reserved:
-            continue
+    paths = sorted(
+        (
+            path
+            for path in root.rglob("*")
+            if path.is_file() and path.name not in reserved
+        ),
+        key=lambda path: path.relative_to(root).as_posix(),
+    )
+    for path in paths:
+        relative = path.relative_to(root).as_posix()
+        file_digest = hashlib.sha256()
+        size = 0
         try:
-            stat = path.stat()
+            with path.open("rb") as source:
+                while chunk := source.read(8 * 1024 * 1024):
+                    file_digest.update(chunk)
+                    size += len(chunk)
         except OSError:
             continue
-        records.append((path.relative_to(root).as_posix(), stat.st_size, int(stat.st_mtime)))
 
-    records.sort()
-    for relative, size, mtime_ns in records:
         digest.update(relative.encode("utf-8"))
         digest.update(b"\0")
         digest.update(str(size).encode("ascii"))
         digest.update(b"\0")
-        digest.update(str(mtime_ns).encode("ascii"))
+        digest.update(file_digest.digest())
         digest.update(b"\n")
         files += 1
         total_bytes += size
