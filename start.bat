@@ -7,7 +7,7 @@ set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 set "APP_NAME=glm53-flash-nota-b300"
 set "MODAL_WORKSPACE="
-for /f "tokens=3" %%A in ('uv run modal profile current ^| findstr /b /c:"Active profile:"') do set "MODAL_WORKSPACE=%%A"
+for /f "usebackq delims=" %%A in (`uv run modal profile current 2^>nul`) do set "MODAL_WORKSPACE=%%A"
 if not defined MODAL_WORKSPACE goto :profile_error
 
 set "PUBLIC_BASE_URL=https://%MODAL_WORKSPACE%--%APP_NAME%-serve.modal.run"

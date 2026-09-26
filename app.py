@@ -135,6 +135,17 @@ ALL_CACHE_ARTIFACTS = RUNTIME_CACHE_ARTIFACTS + STAGED_CACHE_ARTIFACTS
 
 MAX_B300_CONTAINERS = 1
 MAX_CONCURRENT_INPUTS = 16
+MAX_NUM_BATCHED_TOKENS = 8192
+MTP_SPECULATIVE_TOKENS = 5
+MTP_DECODE_TOKENS_PER_REQUEST = MTP_SPECULATIVE_TOKENS + 1
+CUDAGRAPH_CAPTURE_SIZES = tuple(
+    range(
+        MTP_DECODE_TOKENS_PER_REQUEST,
+        MTP_DECODE_TOKENS_PER_REQUEST * MAX_CONCURRENT_INPUTS + 1,
+        MTP_DECODE_TOKENS_PER_REQUEST,
+    )
+)
+MAX_CUDAGRAPH_CAPTURE_SIZE = CUDAGRAPH_CAPTURE_SIZES[-1]
 SCALEDOWN_WINDOW_SECONDS = 1800
 
 # 已实测：Modal Volume(9P) 上 prefetch-16 明显优于 default / eager。
@@ -418,15 +429,28 @@ def serve():
         "1",
         "--gpu-memory-utilization",
         "0.96",
-        "--enforce-eager",
+        "--max-num-seqs",
+        str(MAX_CONCURRENT_INPUTS),
+        "--max-num-batched-tokens",
+        str(MAX_NUM_BATCHED_TOKENS),
         "--compilation-config",
-        json.dumps({"cudagraph_mode": "PIECEWISE"}),
+        json.dumps(
+            {
+                "cudagraph_mode": "FULL_DECODE_ONLY",
+                "cudagraph_capture_sizes": CUDAGRAPH_CAPTURE_SIZES,
+            }
+        ),
         "--max-cudagraph-capture-size",
-        "1008",
+        str(MAX_CUDAGRAPH_CAPTURE_SIZE),
         "--kv-cache-dtype",
         "fp8",
         "--speculative-config",
-        json.dumps({"method": "mtp", "num_speculative_tokens": 5}),
+        json.dumps(
+            {
+                "method": "mtp",
+                "num_speculative_tokens": MTP_SPECULATIVE_TOKENS,
+            }
+        ),
         "--tool-call-parser",
         "glm47",
         "--reasoning-parser",

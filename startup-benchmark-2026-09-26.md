@@ -8,9 +8,9 @@ vLLM：0.28.1rc1.dev580+g385dce36b
 加载策略：prefetch-16，16 MiB block  
 KV Cache：FP8  
 MTP：5 speculative tokens  
-CUDA Graph：PIECEWISE，max capture size=1008
+初始基线 CUDA Graph：PIECEWISE，max capture size=1008
 
-## 本轮结果
+## A 组：初始 PIECEWISE / 1008 基线
 
 | 阶段 | 实测 |
 |---|---:|
@@ -77,9 +77,9 @@ CUDA Graph 已经是明确的大型冷启动瓶颈。
 FlashInfer autotune 从 11:09:11.416 到 11:13:28.263，最终保存 66 个新配置。  
 其中 flashinfer::trtllm_fp4_block_scale_moe 的 22-profile 主循环约 190 s。
 
-## 结论
+## A 组当时结论
 
-当前真实 cold start 的主要问题已经不只是权重：
+在 A 组初始基线中，cold start 的主要问题已经不只是权重：
 
 1. FlashInfer autotune：约 256.85 s
 2. Model loading：162.53 s
@@ -87,14 +87,14 @@ FlashInfer autotune 从 11:09:11.416 到 11:13:28.263，最终保存 66 个新�
 
 这三项合计约 577.37 s，占 API Ready 829.884 s 的约 69.6%。
 
-下一轮最值得测试：
+当时规划的下一轮测试：
 
 - A：当前 PIECEWISE / 1008
 - B：enforce eager
 - C：PIECEWISE / 512
 - D：PIECEWISE / 256
 
-另外需要特别验证 FlashInfer autotune cache 在下一次新容器中是否能复用；若 cache 没有跨容器持久化，256 s 级 autotune 会持续成为最大的冷启动成本。
+当时仍需特别验证 FlashInfer autotune cache 在下一次新容器中是否能复用；该问题后来已在 D 组验证解决。
 
 ---
 
@@ -159,4 +159,279 @@ API Ready 总时间只缩短约 32.80 s（约 3.95%）。
 
 `enforce eager` 可以完全消除 CUDA Graph capture，并释放约 4.62 GiB 显存给 KV Cache，但本轮真实 cold start 只从 829.884 s 降到 797.083 s。
 
-当前真正最大的启动瓶颈仍然是 FlashInfer autotune，而不是 CUDA Graph。
+在 B 组当时的未命中状态下，最大的启动瓶颈仍然是 FlashInfer autotune，而不是 CUDA Graph；该结论只描述该历史实验，不代表后续 cache-hit 配置。
+
+---
+
+## C 组：FlashInfer autotune cache 持久化
+
+目标：把默认的
+
+`/root/.cache/vllm/flashinfer_autotune_cache`
+
+挂载到独立 Modal Volume：
+
+`glm53-flash-nota-flashinfer-autotune`
+
+并在 API Ready 后显式执行 `commit()`。
+
+### C1：首次灌 cache
+
+- vLLM process start：19:36:44
+- 主权重 Loading weights：72.46 s
+- Model loading：112.401 s
+- FlashInfer autotune start：19:41:52
+- FlashInfer autotune end：19:46:31
+- autotune 总时长：约 279.4 s
+- 保存：66 configs
+- previous config：0
+- API Ready：752.019 s
+- cache commit：19:49:16
+- first warmup：13.955 s
+
+日志明确：
+
+`Saved 66 configs ... (66 new, 0 from previous config)`
+
+`[FLASHINFER_AUTOTUNE_CACHE_COMMIT]`
+
+Volume 中已经确认存在：
+
+`0.6.18/103a/92abe8178cfd81374e9ac2c11b7dd931d918e418d0296c3303a037b5c33df826/autotune_configs.json`
+
+文件大小：15.9 KiB。
+
+因此 FlashInfer autotune cache 的持久化写入已经验证成功。
+
+### C2：新容器 cache-hit 验证
+
+第一次 C2 在权重加载结束时被 Dashboard 外部 stop：
+
+`Stopping app - user stopped from dashboard.`
+
+第二次改用独立 benchmark app：
+
+`glm53-flash-nota-b300-cache-bench`
+
+但本地触发请求会话先因 AgentDock 默认约 8 分钟超时而中断，导致 web-server startup 请求结束。
+
+随后已修正为 1800 秒请求会话，但在重新部署时 Modal workspace 达到 spend limit：
+
+`Workspace ... has exceeded its spend limit`
+
+该阶段当时因为 spend limit 暂时无法完成 C2；后续 D 组已经完成最终验证：
+
+- cache 文件持久化：✅
+- cache 文件跨容器 Volume 可见：✅
+- 新容器读取 previous configs：✅
+- 原约 279~286 s autotune 在相同配置 key 下可降到约 2 s 级：✅
+
+因此 C2 的验证项已经关闭。不同 serving 参数可能产生新的 FlashInfer cache key；首次生成后仍需重新持久化对应 key。
+
+
+---
+
+## D 组：cache-hit 后的真实冷启动验证
+
+### D1：21:46 部署实例
+
+App：`ap-RCGXZcAX9hi32IgcC0IbwV`
+
+关键日志：
+
+- 第一段主权重 Loading weights：38.29 s
+- 第二段 MTP 权重 Loading weights：7.32 s
+- Model loading 总计：50.883 s
+- model init done：155.609 s（from process start）
+- KV cache ready：173.988 s
+- KV cache：51.96 GiB / 7,130,316 tokens / 1M context 6.80x
+- JIT kernel warmup：0.10 s
+- FlashInfer autotune：命中 66/66，`0 new, 66 from previous config`
+- FlashInfer autotune done：177.631 s（from process start）
+- engine profile/create KV/warmup：31.69 s
+- API Ready：191.389 s
+- 1-token warmup：0.317 s
+
+结论：FlashInfer autotune cache 已经完成跨容器复用，原先约 279~286 s 的 autotune 已经降到约 2 s 级别。
+
+### D2：22:09 部署实例
+
+App：`ap-3vhMrH10hFWT4c33srBXQv`
+
+关键日志：
+
+- page-cache prefetch：2.94 s
+- 第二段 MTP 权重 Loading weights：6.04 s
+- Model loading 总计：41.542 s
+- model init done：123.492 s（from process start）
+- KV cache ready：136.344 s
+- KV cache：51.96 GiB / 7,130,316 tokens / 1M context 6.80x
+- JIT kernel warmup：0.06 s
+- FlashInfer autotune：66/66 cache hit
+- FlashInfer autotune done：139.186 s（from process start）
+- engine profile/create KV/warmup：22.65 s
+- API Ready：149.504 s
+- 1-token warmup：0.241 s
+- Triton archive sync：2216 files / 85.1 MB，unchanged
+- TorchInductor archive sync：26 files / 1.66 MB，unchanged
+- CUDA compute cache sync：94 files / 761 MB，0.572 s，unchanged
+
+截至目前，这是已观察到的最快完整 cold-start：**vLLM process → API Ready = 149.504 s**。
+
+与最早 A 组 829.884 s 相比，缩短约 **680.38 s / 82.0%**。
+
+> 注意：这里仍然使用 `--enforce-eager`，因此 CUDA Graph capture 为 0；该结果不能代表开启 CUDA Graph 后的启动时间。
+
+---
+
+## Modal App 运行历史（2026-09-26）
+
+下面记录 Modal 返回的 app 生命周期，便于后续把日志和具体实验对应起来。  
+**生命周期不等于模型 cold-start 时间**：其中很多 8~36 秒的 app 是 deploy 流程里的 CPU helper（secret/cache/compact/publish 等）任务。
+
+| App ID | 创建 | 停止 | 生命周期 |
+|---|---|---|---:|
+| ap-3vhMrH10hFWT4c33srBXQv | 22:09:42 | 22:15:06 | 324 s |
+| ap-NXPTHXVaQmeETFDKx0pjJq | 22:04:39 | 22:04:52 | 13 s |
+| ap-Pd6DKguo2cwBc8Ugoe8NR6 | 22:03:51 | 22:04:07 | 16 s |
+| ap-EbKMBbSwYoxPhG2N9Zn2m5 | 22:03:51 | 22:04:05 | 14 s |
+| ap-oxsSlQS6MICawp3VTg3aiT | 22:03:26 | 22:04:02 | 36 s |
+| ap-isW5qFyfcZoyklq0d5LGwP | 22:01:58 | 22:03:49 | 111 s |
+| ap-YqSihyINNbyMCyLDNqeLgI | 22:00:57 | 22:03:48 | 171 s |
+| ap-RCGXZcAX9hi32IgcC0IbwV | 21:46:42 | 21:53:16 | 394 s |
+| ap-iAb1SqaqEY8C6Ts4yrAncw | 21:45:58 | 21:46:33 | 35 s |
+| ap-BvZ8vHhv2CUT3xKlL94zXH | 21:34:12 | 21:38:49 | 277 s |
+| ap-tw3IVYzAmo7fECf06cHEi1 | 21:33:13 | 21:36:03 | 170 s |
+| ap-HwlvZijCdlEEzUV06HYhT5 | 21:24:08 | 21:33:24 | 556 s |
+| ap-s4OrsYX3qDvUaXISil6tpk | 21:24:38 | 21:24:46 | 8 s |
+| ap-fHPI31hggwMQFIGd19PDgs | 21:24:27 | 21:24:36 | 9 s |
+| ap-Twy28vdsbRcXUXTdUeUA0s | 20:54:45 | 21:18:30 | 1425 s |
+| ap-fnfKtJJBrXJ7bBmza6uVz6 | 21:14:47 | 21:14:59 | 12 s |
+| ap-hzQd3a9izG8YljQfHsmlIf | 21:14:36 | 21:14:45 | 9 s |
+| ap-KQSiWsJT8fLkQpjFSwuW8i | 21:14:18 | 21:14:33 | 15 s |
+| ap-TbD3K11KwEjm1regtmgpd2 | 20:54:34 | 20:54:43 | 9 s |
+| ap-9GUaWcJ6cEUG0ncVrebnp9 | 20:54:21 | 20:54:31 | 10 s |
+| ap-kgINww42TBriM1A0u5d7PX | 20:54:08 | 20:54:18 | 10 s |
+| ap-q0PxhEG4S2naqD0ER2wTr3 | 20:36:54 | 20:52:34 | 940 s |
+| ap-ieWcuuAfcL01gW0tUHJjQO | 20:36:44 | 20:36:52 | 8 s |
+| ap-TX8kYJRYcLkdja9Pnr90HQ | 20:36:33 | 20:36:41 | 8 s |
+| ap-neXSTmzmY8FLqF1Umridx6 | 20:36:12 | 20:36:31 | 19 s |
+
+已确认的长 GPU 启动/服务实例至少包括：
+
+- `ap-RCGXZcAX9hi32IgcC0IbwV`：API Ready 191.389 s
+- `ap-3vhMrH10hFWT4c33srBXQv`：API Ready 149.504 s
+- `ap-Twy28vdsbRcXUXTdUeUA0s`：日志中观察到主权重 Loading weights 70.84 s，但该实例未提取到完整 API Ready 关键行
+
+---
+
+## 008 长输出推理吞吐基准
+
+从下一次启动开始，API Ready 后不再只生成 1 token，而是连续执行两道需要推理的问题：
+
+1. 12 枚硬币 / 3 次天平称量的完整决策策略；
+2. 全球多区域超大模型推理平台的架构、调度、缓存、SLO 与成本权衡。
+
+每题参数：
+
+- `max_tokens=8092`
+- `temperature=0`
+- timeout：900 s
+- 日志输出：prompt tokens / completion tokens / request seconds / `approx_completion_tps` / finish reason
+
+其中 `approx_completion_tps = completion_tokens / request_s`，它包含 prefill/TTFT，因此是保守的端到端近似值；如果要得到严格 decode tok/s，后续再增加 streaming 首 token 时间点即可。
+
+---
+
+## 正式高吞吐 serving 配置
+
+目标改为：**稳态 decode token/s 优先，冷启动时间退居其次。**
+
+当前正式配置：
+
+- 单 B300 / TP=1
+- NVFP4 权重
+- FP8 KV Cache
+- MTP speculative tokens = 5
+- `max_num_seqs = 16`
+- `max_num_batched_tokens = 8192`
+- CUDA Graph：`FULL_DECODE_ONLY`
+- MTP5 uniform decode query length = 6
+- CUDA Graph capture sizes：`6,12,18,...,96`
+- 最大 CUDA Graph capture size：96
+- 已删除 `--enforce-eager`
+
+capture sizes 与 1~16 并发一一对应：
+
+`6 * concurrent_requests`
+
+因此分别覆盖 1 到 16 个并发请求的 MTP5 uniform decode batch，避免重新回到 PIECEWISE/1008 时大量无关 shape 的 capture。
+
+
+---
+
+## E 组：FULL_DECODE_ONLY 正式部署实测
+
+部署 App：`ap-kJAdxaxdHeyeMxQL0IMwiy`
+
+配置：
+
+- `FULL_DECODE_ONLY`
+- capture sizes：`6,12,...,96`
+- `max_num_seqs=16`
+- `max_num_batched_tokens=1024`
+- MTP5
+- FP8 KV
+- 无 `--enforce-eager`
+
+启动关键数据：
+
+- vLLM process start：23:14:05
+- 主权重 Loading weights：39.30 s
+- MTP 权重 Loading weights：6.32 s
+- Model loading：50.675 s
+- model init done：146.368 s
+- CUDA Graph capture：**9 s**
+- CUDA Graph memory：**1.39 GiB**
+- KV cache：53.63 GiB / 7,355,011 tokens / 1M context 7.01x
+- JIT kernel warmup：0.15 s
+- FlashInfer autotune：首次新 key，36 new / 0 previous
+- FlashInfer autotune：约 169.7 s
+- engine init：219.84 s
+- API Ready：**370.030 s**
+
+说明：本轮 API Ready 较慢主要是新的 FlashInfer autotune cache key 首次生成；该 cache 已在本轮结束后 commit 并发布到 GitHub Release。
+
+长输出 benchmark：
+
+| Case | Prompt | Completion | 时间 | 端到端 completion tok/s |
+|---|---:|---:|---:|---:|
+| logic | 107 | 8092 | 43.048 s | **187.976 tok/s** |
+| systems | 148 | 8092 | 52.044 s | **155.485 tok/s** |
+
+合计：
+
+- completion tokens：16,184
+- 总 generation request 时间：95.092 s
+- 加权端到端吞吐：约 **170.20 tok/s**
+
+vLLM 10 秒窗口观察到的 generation throughput：
+
+- Case 1：167.0 / 178.4 / 171.1 / **189.2 tok/s**
+- Case 2：164.3 / 146.6 / 148.5 / 163.1 / 180.1 tok/s
+
+MTP5 acceptance：
+
+- Case 1 观察区间约 32.9%~47.9%
+- Case 2 观察区间约 24.0%~39.6%
+
+本轮同时生成/更新的可持久化缓存：
+
+- Triton：2288 files / 90.5 MB，changed=true
+- CUDA Compute：310 files / 922.5 MB，changed=true
+- FlashInfer autotune：已 commit，并重新发布 GitHub Release
+- TileLang：已重新发布 GitHub Release
+
+额外观察：
+
+上一轮 `max_num_batched_tokens=1024` 时 vLLM 明确给出性能警告：在 MTP5 下 scheduled token budget 偏小，可能限制 speculative decoding 的最佳吞吐。正式配置已提高到 `8192`；该值也与当前 vLLM GLM-5.3 recipe 中 `max_num_seqs=16` 的已验证配置一致。
