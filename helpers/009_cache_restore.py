@@ -62,6 +62,26 @@ def _cache_ready(artifact: CacheArtifact) -> bool:
     return _path_has_required(Path(artifact.local_path), artifact.required_globs)
 
 
+def cache_fingerprint(artifact: CacheArtifact) -> tuple[tuple[str, int, int], ...]:
+    """Return a cheap metadata fingerprint for cache artifacts matched by required_globs."""
+    root = Path(artifact.local_path)
+    if not root.exists():
+        return ()
+
+    records: dict[str, tuple[str, int, int]] = {}
+    for pattern in artifact.required_globs:
+        for path in root.glob(pattern):
+            if not path.is_file():
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            rel = path.relative_to(root).as_posix()
+            records[rel] = (rel, stat.st_size, stat.st_mtime_ns)
+    return tuple(records[key] for key in sorted(records))
+
+
 def _safe_extract(archive: Path, destination: Path) -> None:
     destination.mkdir(parents=True, exist_ok=True)
     root = destination.resolve()

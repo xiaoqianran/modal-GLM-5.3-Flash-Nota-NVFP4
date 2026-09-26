@@ -30,6 +30,7 @@ step_008_run_warmup = importlib.import_module(
 ).step_008_run_warmup
 cache_restore_module = importlib.import_module("helpers.009_cache_restore")
 CacheArtifact = cache_restore_module.CacheArtifact
+cache_fingerprint = cache_restore_module.cache_fingerprint
 step_009_restore_cache = cache_restore_module.step_009_restore_cache
 step_010_publish_cache = importlib.import_module(
     "helpers.010_cache_publish"
@@ -263,6 +264,10 @@ def step_002_bench_weights(
 def serve():
     """启动单 B300 vLLM 服务，并在服务就绪后自动发送一次最小 warmup 请求。"""
     cache_sources = _restore_runtime_caches()
+    cache_fingerprints_before = {
+        artifact.name: cache_fingerprint(artifact)
+        for artifact in RUNTIME_CACHE_ARTIFACTS
+    }
 
     strategy = os.environ.get(
         "GLM53_LOAD_STRATEGY",
@@ -350,13 +355,25 @@ def serve():
                 f"[RUNTIME_CACHE_COMMIT] name={artifact.name} path={artifact.local_path}",
                 flush=True,
             )
-            if cache_sources.get(artifact.name) != "miss":
+
+            before = cache_fingerprints_before.get(artifact.name, ())
+            after = cache_fingerprint(artifact)
+            changed = before != after
+            if changed:
+                print(
+                    f"[RUNTIME_CACHE_CHANGED] name={artifact.name} "
+                    f"before_files={len(before)} after_files={len(after)}",
+                    flush=True,
+                )
+
+            if not changed and cache_sources.get(artifact.name) != "miss":
                 continue
             try:
                 step_010_publish_cache(
                     artifact,
                     github_repo=GITHUB_REPO,
                     release_tag=CACHE_RELEASE_TAG,
+                    replace_existing=changed,
                 )
             except Exception as exc:
                 print(

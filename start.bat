@@ -6,7 +6,7 @@ chcp 65001 >nul
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 set "APP_NAME=glm53-flash-nota-b300"
-set "URL=https://wangbudiaoqaq--glm53-flash-nota-b300-serve.modal.run/v1/models"
+set "URL=https://zhiyuqqq--glm53-flash-nota-b300-serve.modal.run/v1/models"
 
 echo Starting or waking deployed B300 service...
 echo %URL%
