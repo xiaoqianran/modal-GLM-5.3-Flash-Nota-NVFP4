@@ -1,4 +1,5 @@
 import re
+import os
 import subprocess
 import threading
 import time
@@ -37,16 +38,34 @@ class _ModelInitObserver:
         self.model_started_at: float | None = None
         self.weight_started_at: float | None = None
         self.weight_done_at: float | None = None
+        self.milestones: dict[str, float] = {}
+
+    def _milestone(self, name: str, now: float) -> None:
+        if name in self.milestones:
+            return
+        previous = next(reversed(self.milestones.values())) if self.milestones else self.process_started_at
+        self.milestones[name] = now
+        print(f"[003_PREWEIGHT_MILESTONE] name={name} "
+              f"from_process_start_s={now - self.process_started_at:.3f} "
+              f"since_previous_milestone_s={now - previous:.3f}", flush=True)
 
     def observe(self, line: str) -> None:
         """识别 vLLM 原生日志，并输出 003 阶段的结构化计时。"""
         now = time.perf_counter()
 
+        if "api_utils.py" in line and re.search(r"\bversion\s+\d", line):
+            self._milestone("api_banner", now)
+        if "Resolved architecture:" in line:
+            self._milestone("mtp_architecture" if "MTP" in line else "main_architecture", now)
+        if "Initializing a V1 LLM engine" in line:
+            self._milestone("engine_init", now)
+
         if (
             self.model_started_at is None
-            and "Starting to load model" in line
+            and ("Starting to load model" in line or "Loading model from scratch" in line)
         ):
             self.model_started_at = now
+            self._milestone("model_load_start", now)
             print(
                 "[003_MODEL_INIT_START] "
                 f"from_process_start_s={now - self.process_started_at:.3f}",
@@ -61,6 +80,7 @@ class _ModelInitObserver:
             )
         ):
             self.weight_started_at = now
+            self._milestone("weight_load_start", now)
             print(
                 "[003_WEIGHT_LOAD_START] "
                 f"from_process_start_s={now - self.process_started_at:.3f}",
@@ -129,12 +149,19 @@ def step_003_start_vllm_with_model_init_observer(
     process_started_at = time.perf_counter()
     print("[003_VLLM_PROCESS_START]", flush=True)
 
+    process_env = os.environ.copy()
+    process_env["GLM53_PROCESS_STARTED_AT"] = str(process_started_at)
+    if process_env.get("GLM53_PROFILE_IMPORTS", "0") == "1":
+        # Inherited by registry subprocesses and spawned EngineCore. Opt-in:
+        # importtime itself perturbs timing and emits a large import tree.
+        process_env["PYTHONPROFILEIMPORTTIME"] = "1"
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        env=process_env,
     )
 
     observers: list[_LineObserver] = [

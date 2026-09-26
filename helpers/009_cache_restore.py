@@ -6,6 +6,7 @@ import os
 import shutil
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -67,6 +68,37 @@ def _cache_ready(artifact: CacheArtifact) -> bool:
     return _path_has_required(Path(artifact.local_path), artifact.required_globs)
 
 
+def _availability_path(directory: str, artifact: CacheArtifact, repo: str,
+                       tag: str, scope: str) -> Path:
+    identity = json.dumps([repo, tag, scope, artifact.name, artifact.release_asset])
+    digest = hashlib.sha256(identity.encode()).hexdigest()
+    return Path(directory) / f"{digest}.json"
+
+
+def _record_availability(path: Path | None, state: str) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".availability-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump({"schema": 1, "state": state, "checked_at": time.time()}, stream)
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def _read_availability(path: Path | None) -> str:
+    if path is not None:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if payload.get("schema") == 1:
+                return payload.get("state", "unknown")
+        except (OSError, ValueError, AttributeError):
+            pass
+    return "unknown"
+
+
 def cache_fingerprint(artifact: CacheArtifact) -> tuple[tuple[str, int, str], ...]:
     """Return a content fingerprint so mtime-only rewrites do not republish assets."""
     root = Path(artifact.local_path)
@@ -104,14 +136,34 @@ def step_009_restore_cache(
     *,
     github_repo: str,
     release_tag: str,
+    availability_dir: str | None = None,
+    availability_scope: str = "",
+    remote_policy: str = "refresh",
 ) -> str:
     """优先使用 Modal Volume；缺失时再从 GitHub Release 恢复缓存。"""
+    if remote_policy not in {"refresh", "deployment"}:
+        raise ValueError(f"Unknown remote cache policy: {remote_policy}")
+    availability = (
+        _availability_path(availability_dir, artifact, github_repo, release_tag, availability_scope)
+        if availability_dir else None
+    )
     if _cache_ready(artifact):
+        if remote_policy == "refresh":
+            _record_availability(availability, "local")
         print(f"[009_CACHE_VOLUME_SEED] name={artifact.name}", flush=True)
         return "modal"
 
+    if remote_policy == "deployment":
+        state = _read_availability(availability)
+        if state not in {"available", "local"}:
+            print(f"[009_CACHE_REMOTE_SKIP] name={artifact.name} "
+                  f"deployment_state={state} reason=optional_cache_not_available", flush=True)
+            return "miss"
+
     token = os.environ.get("GITHUB_TOKEN", "").strip()
     if not token:
+        if remote_policy == "refresh":
+            _record_availability(availability, "unknown")
         print(
             f"[009_CACHE_MISS] name={artifact.name} reason=no_github_token",
             flush=True,
@@ -123,8 +175,10 @@ def step_009_restore_cache(
         f"{urllib.parse.quote(release_tag, safe='')}"
     )
 
+    release_loaded = False
     try:
         release = _read_json(_github_request(release_url, token=token))
+        release_loaded = True
         asset = next(
             (
                 item
@@ -134,11 +188,14 @@ def step_009_restore_cache(
             None,
         )
         if asset is None:
+            _record_availability(availability, "absent")
             print(
                 f"[009_CACHE_MISS] name={artifact.name} reason=asset_not_found",
                 flush=True,
             )
             return "miss"
+
+        _record_availability(availability, "available")
 
         with tempfile.TemporaryDirectory(prefix="glm53-cache-") as temp_dir:
             temp_root = Path(temp_dir)
@@ -162,6 +219,8 @@ def step_009_restore_cache(
             shutil.copytree(extracted, destination, dirs_exist_ok=True)
 
     except urllib.error.HTTPError as exc:
+        if remote_policy == "refresh":
+            _record_availability(availability, "absent" if exc.code == 404 and not release_loaded else "unknown")
         reason = "release_not_found" if exc.code == 404 else f"github_http_{exc.code}"
         print(
             f"[009_CACHE_MISS] name={artifact.name} reason={reason}",
@@ -169,6 +228,8 @@ def step_009_restore_cache(
         )
         return "miss"
     except Exception as exc:
+        if remote_policy == "refresh":
+            _record_availability(availability, "unknown")
         print(
             f"[009_CACHE_MISS] name={artifact.name} "
             f"reason=github_restore_failed error={type(exc).__name__}",

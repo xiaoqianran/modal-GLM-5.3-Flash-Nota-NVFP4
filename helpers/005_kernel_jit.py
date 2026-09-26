@@ -1,5 +1,6 @@
 import re
 import time
+from collections.abc import Callable
 
 
 _DYNAMO_RE = re.compile(
@@ -44,8 +45,12 @@ _KERNEL_BACKENDS = {
 class _KernelJITObserver:
     """观测 torch.compile 与 kernel/JIT 相关日志，不改变编译配置。"""
 
-    def __init__(self, process_started_at: float) -> None:
+    def __init__(
+        self, process_started_at: float,
+        on_flashinfer_saved: Callable[[], None] | None = None,
+    ) -> None:
         self.process_started_at = process_started_at
+        self.on_flashinfer_saved = on_flashinfer_saved
         self.compile_started_at: float | None = None
         self.dynamo_s: float | None = None
         self.graph_compile_s: list[float] = []
@@ -107,10 +112,13 @@ class _KernelJITObserver:
                 f"total_configs={total_configs} "
                 f"new_configs={new_configs} "
                 f"previous_configs={previous_configs} "
-                f"actual_cache_hit={str(previous_configs > 0).lower()} "
+                f"actual_cache_hit={str(previous_configs > 0 and new_configs == 0).lower()} "
+                f"partial_cache_hit={str(previous_configs > 0 and new_configs > 0).lower()} "
                 f"from_process_start_s={now - self.process_started_at:.3f}",
                 flush=True,
             )
+            if self.on_flashinfer_saved is not None:
+                self.on_flashinfer_saved()
 
         cache_match = _CACHE_DIR_RE.search(line)
         if cache_match:
@@ -190,6 +198,8 @@ class _KernelJITObserver:
 
 def step_005_create_kernel_jit_observer(
     process_started_at: float,
+    *,
+    on_flashinfer_saved: Callable[[], None] | None = None,
 ) -> _KernelJITObserver:
     """创建 005 Kernel/JIT observer，供唯一 vLLM 日志流统一调用。"""
-    return _KernelJITObserver(process_started_at)
+    return _KernelJITObserver(process_started_at, on_flashinfer_saved)

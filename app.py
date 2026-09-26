@@ -63,9 +63,6 @@ startup_acceleration_module = importlib.import_module(
 step_018_prepare_startup_plan_cache = (
     startup_acceleration_module.step_018_prepare_startup_plan_cache
 )
-step_018_count_startup_plan_files = (
-    startup_acceleration_module.step_018_count_startup_plan_files
-)
 
 
 APP_NAME = os.getenv("GLM53_APP_NAME", "glm53-flash-nota-b300")
@@ -76,6 +73,9 @@ MODEL = "nota-ai/GLM-5.3-Flash-Nota-NVFP4"
 REVISION = "c5fc7f5ef0447ab030559bb4b08861a36dbbe847"
 MODEL_RUNTIME_PATH = "/tmp/glm53-model"
 RUNTIME_IMAGE = "vllm/vllm-openai:glm53-flash"
+# Verified from /usr/local/bin/vllm's shebang in this image. Modal's added
+# /usr/local/bin/python3 has a different site-packages and cannot import vLLM.
+VLLM_RUNTIME_PYTHON = "/usr/bin/python3"
 
 PROJECT_VOLUME_NAME = "modal-GLM-5.3-Flash-Nota-NVFP4"
 PROJECT_VOLUME_ROOT = "/project-volume"
@@ -84,6 +84,9 @@ VLLM_LOCAL_CACHE_ROOT = "/root/.cache/vllm"
 VLLM_STARTUP_PLAN_CACHE = (
     f"{PROJECT_VOLUME_ROOT}/glm53-flash-nota-vllm-startup-plan"
 )
+VLLM_MODELINFO_CACHE = f"{PROJECT_VOLUME_ROOT}/glm53-flash-nota-vllm-modelinfos"
+STARTUP_CAPABILITIES_PATH = "/root/glm53-startup-capabilities.json"
+CACHE_AVAILABILITY_DIR = f"{PROJECT_VOLUME_ROOT}/glm53-cache-release-availability"
 FLASHINFER_AUTOTUNE_VERSION = "0.6.18"
 FLASHINFER_AUTOTUNE_ARCH = "103a"
 FLASHINFER_AUTOTUNE_CACHE = (
@@ -289,6 +292,11 @@ runtime_image = (
         "/tmp/019_patch_vllm_prefetch.py",
         copy=True,
     )
+    .add_local_file(
+        "helpers/021_patch_startup_observability.py",
+        "/tmp/021_patch_startup_observability.py",
+        copy=True,
+    )
     .run_commands(
         "python3 /tmp/019_patch_vllm_prefetch.py",
         "python3 -c \"from pathlib import Path; "
@@ -298,7 +306,8 @@ runtime_image = (
         "new='maybe_save_startup_plan(self, int(self.available_kv_cache_memory_bytes))'; "
         "assert s.count(old)==1, f'unexpected startup-plan save call count: {s.count(old)}'; "
         "p.write_text(s.replace(old,new)); "
-        "print('[IMAGE_PATCH] startup plan saves actual KV cache bytes')\""
+        "print('[IMAGE_PATCH] startup plan saves actual KV cache bytes')\"",
+        f"{VLLM_RUNTIME_PYTHON} /tmp/021_patch_startup_observability.py",
     )
     .env(
         {
@@ -308,6 +317,8 @@ runtime_image = (
             "VLLM_SERVER_DEV_MODE": "0",
             "VLLM_CACHE_ROOT": VLLM_LOCAL_CACHE_ROOT,
             "VLLM_ENABLE_STARTUP_PLAN": "1",
+            "GLM53_PROFILE_IMPORTS": os.getenv("GLM53_PROFILE_IMPORTS", "0"),
+            "GLM53_CACHE_DISASTER_RECOVERY": os.getenv("GLM53_CACHE_DISASTER_RECOVERY", "0"),
             "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": FLASHINFER_AUTOTUNE_RUNTIME_CACHE,
             "FLASHINFER_WORKSPACE_BASE": FLASHINFER_WORKSPACE_BASE,
             "TORCHINDUCTOR_COMPILE_THREADS": "1",
@@ -327,6 +338,41 @@ runtime_image = (
 app = modal.App(APP_NAME)
 
 
+@app.function(image=runtime_image, cpu=2, memory=8192, timeout=300)
+def inspect_startup_runtime(smoke_test: bool = False):
+    """CPU-only check of the actual image contracts; does not start vLLM/GPU."""
+    from pathlib import Path
+    import subprocess
+
+    capabilities = json.loads(Path(STARTUP_CAPABILITIES_PATH).read_text())
+    subprocess.run(
+        [VLLM_RUNTIME_PYTHON, "-c",
+         "import helpers.startup_trace, helpers.startup_prefetch; "
+         "import importlib.metadata as m; print('Runtime vLLM:', m.version('vllm'))"],
+        check=True,
+    )
+    if smoke_test:
+        result = subprocess.run(
+            [VLLM_RUNTIME_PYTHON, "-c",
+             # CUDA image cannot infer a device in this CPU-only function.
+             # Set CPU platform only for the diagnostic --help subprocess.
+             "import runpy, sys; import vllm.platforms; "
+             "from vllm.platforms.cpu import CpuPlatform; "
+             "vllm.platforms.current_platform = CpuPlatform(); "
+             "sys.argv = ['vllm', 'serve', '/tmp/glm53-model', '--help']; "
+             "runpy.run_module('helpers.020_vllm_bootstrap', run_name='__main__')"],
+            capture_output=True, text=True, timeout=180,
+        )
+        for line in result.stdout.splitlines():
+            if "[STARTUP_TRACE]" in line:
+                print(line, flush=True)
+        if result.returncode:
+            raise RuntimeError(f"CLI smoke failed: {result.stderr[-5000:]}")
+        capabilities["cli_help_cpu_platform_smoke"] = "passed"
+    print(json.dumps(capabilities, indent=2), flush=True)
+    return capabilities
+
+
 @app.function(
     image=download_image,
     cpu=4,
@@ -340,13 +386,18 @@ def step_001_download():
     step_001_download_model(MODEL, REVISION, project_volume)
 
 
-def _restore_cache_artifacts(artifacts) -> dict[str, str]:
+def _restore_cache_artifacts(artifacts, *, serving: bool = False) -> dict[str, str]:
     results: dict[str, str] = {}
     for artifact in artifacts:
+        optional_jit = artifact.name == "flashinfer-jit"
+        use_deployment = serving and os.getenv("GLM53_CACHE_DISASTER_RECOVERY", "0") != "1"
         source = step_009_restore_cache(
             artifact,
             github_repo=GITHUB_REPO,
             release_tag=CACHE_RELEASE_TAG,
+            availability_dir=CACHE_AVAILABILITY_DIR if optional_jit else None,
+            availability_scope=RUNTIME_IMAGE,
+            remote_policy="deployment" if optional_jit and use_deployment else "refresh",
         )
         results[artifact.name] = source
         if source == "github":
@@ -360,7 +411,11 @@ def _restore_cache_artifacts(artifacts) -> dict[str, str]:
 
 def _restore_runtime_caches() -> dict[str, str]:
     """CPU 部署阶段恢复全部 cache；B300 启动阶段只恢复非 staged cache。"""
-    return _restore_cache_artifacts(ALL_CACHE_ARTIFACTS)
+    results = _restore_cache_artifacts(ALL_CACHE_ARTIFACTS)
+    # Commit the inventory even when no release asset was restored (negative cache).
+    project_volume.commit()
+    print("[009_CACHE_AVAILABILITY_COMMIT] phase=deployment", flush=True)
+    return results
 
 
 def _spawn_cache_backup() -> None:
@@ -630,7 +685,9 @@ def _build_vllm_command(model_path: str) -> list[str]:
     prefetch_block_mib = int(os.environ.get("GLM53_PREFETCH_BLOCK_MIB", "16"))
 
     command = [
-        "vllm",
+        VLLM_RUNTIME_PYTHON,
+        "-m",
+        "helpers.020_vllm_bootstrap",
         "serve",
         model_path,
         "--host",
@@ -818,23 +875,43 @@ def _start_runtime_cache_sync(
     return thread
 
 
-def _start_startup_plan_commit() -> threading.Thread:
-    """首次生成 startup plan 后后台 commit Volume，不延长 API Ready 路径。"""
+def _start_startup_plan_commit(
+    before: dict[str, str], modelinfo_seed: str,
+    observer: startup_acceleration_module.StartupPlanObserver,
+) -> threading.Thread:
+    """Persist changed valid plans and modelinfos, regardless of older cached plans."""
 
     def run() -> None:
         started_at = time.perf_counter()
-        print("[018_STARTUP_PLAN_COMMIT_START]", flush=True)
         try:
+            changed = startup_acceleration_module.changed_startup_plans(
+                before, VLLM_STARTUP_PLAN_CACHE,
+            )
+            modelinfo_changed = startup_acceleration_module.sync_modelinfo_cache(
+                local_cache_root=VLLM_LOCAL_CACHE_ROOT,
+                persistent_dir=modelinfo_seed,
+            )
+            actual_hit, applied = observer.result()
+            print(
+                "[018_STARTUP_PLAN_RESULT] "
+                f"actual_hit={actual_hit} "
+                f"applied_fingerprints={applied} "
+                f"changed_valid_plans={changed}", flush=True,
+            )
+            if not changed and not modelinfo_changed:
+                print("[018_STARTUP_METADATA_COMMIT_SKIP] reason=unchanged", flush=True)
+                return
+            print("[018_STARTUP_METADATA_COMMIT_START]", flush=True)
             project_volume.commit()
         except Exception as exc:
             print(
-                "[018_STARTUP_PLAN_COMMIT_FAILED] "
+                "[018_STARTUP_METADATA_COMMIT_FAILED] "
                 f"error={type(exc).__name__}: {exc}",
                 flush=True,
             )
             return
         print(
-            "[018_STARTUP_PLAN_COMMIT_DONE] "
+            "[018_STARTUP_METADATA_COMMIT_DONE] "
             f"elapsed_s={time.perf_counter() - started_at:.3f}",
             flush=True,
         )
@@ -844,6 +921,28 @@ def _start_startup_plan_commit() -> threading.Thread:
         name="startup-plan-volume-commit",
         daemon=True,
     )
+    thread.start()
+    return thread
+
+
+def _start_flashinfer_cache_commit(before: tuple) -> threading.Thread:
+    """Persist new tuning results even when bulk runtime cache sync is disabled."""
+    artifact = next(a for a in RUNTIME_CACHE_ARTIFACTS if a.name == "flashinfer-autotune")
+
+    def run() -> None:
+        try:
+            after = cache_fingerprint(artifact)
+            if before == after:
+                print("[FLASHINFER_CACHE_COMMIT_SKIP] reason=unchanged", flush=True)
+                return
+            mark_cache_backup_dirty(artifact.local_path)
+            project_volume.commit()
+            print("[FLASHINFER_CACHE_COMMIT_DONE] trigger=autotune_saved", flush=True)
+            _spawn_cache_backup()
+        except Exception as exc:
+            print(f"[FLASHINFER_CACHE_COMMIT_FAILED] error={type(exc).__name__}: {exc}", flush=True)
+
+    thread = threading.Thread(target=run, name="flashinfer-cache-commit", daemon=True)
     thread.start()
     return thread
 
@@ -880,7 +979,15 @@ class VllmServer:
             flush=True,
         )
 
-        cache_sources = _restore_cache_artifacts(RUNTIME_CACHE_ARTIFACTS)
+        cache_sources = _restore_cache_artifacts(RUNTIME_CACHE_ARTIFACTS, serving=True)
+        flashinfer_before = cache_fingerprint(RUNTIME_CACHE_ARTIFACTS[0])
+        self.flashinfer_cache_commit_threads = []
+
+        def on_flashinfer_saved() -> None:
+            self.flashinfer_cache_commit_threads.append(
+                _start_flashinfer_cache_commit(flashinfer_before)
+            )
+
         cache_fingerprints_before = (
             {
                 artifact.name: cache_fingerprint(artifact)
@@ -897,16 +1004,25 @@ class VllmServer:
             destination=MODEL_RUNTIME_PATH,
         )
 
-        startup_plan_existed = step_018_prepare_startup_plan_cache(
+        startup_plan_before = step_018_prepare_startup_plan_cache(
             local_cache_root=VLLM_LOCAL_CACHE_ROOT,
             persistent_dir=VLLM_STARTUP_PLAN_CACHE,
         )
+        modelinfo_seed = startup_acceleration_module.prepare_modelinfo_cache(
+            local_cache_root=VLLM_LOCAL_CACHE_ROOT,
+            persistent_root=VLLM_MODELINFO_CACHE,
+            capabilities_path=STARTUP_CAPABILITIES_PATH,
+        )
+        startup_plan_observer = startup_acceleration_module.StartupPlanObserver()
 
         self.vllm_handle = step_003_start_vllm_with_model_init_observer(
             _build_vllm_command(model_path),
             extra_observer_factories=[
+                lambda _: startup_plan_observer,
                 step_004_create_kv_cache_observer,
-                step_005_create_kernel_jit_observer,
+                lambda started_at: step_005_create_kernel_jit_observer(
+                    started_at, on_flashinfer_saved=on_flashinfer_saved,
+                ),
                 step_006_create_cuda_graph_observer,
             ],
         )
@@ -921,31 +1037,15 @@ class VllmServer:
             raise TimeoutError("vLLM did not become ready")
 
         api_ready_at = time.perf_counter()
+        self.startup_plan_commit_thread = _start_startup_plan_commit(
+            startup_plan_before, modelinfo_seed, startup_plan_observer,
+        )
         step_008_run_warmup(
             model=MODEL,
             process_started_at=self.vllm_handle.started_at,
             api_ready_at=api_ready_at,
             repeats=3,
         )
-        if not startup_plan_existed:
-            startup_plan_files = step_018_count_startup_plan_files(
-                VLLM_STARTUP_PLAN_CACHE
-            )
-            if startup_plan_files:
-                self.startup_plan_commit_thread = _start_startup_plan_commit()
-                print(
-                    "[018_STARTUP_PLAN_CREATED] "
-                    f"files={startup_plan_files} path={VLLM_STARTUP_PLAN_CACHE}",
-                    flush=True,
-                )
-            else:
-                print(
-                    "[018_STARTUP_PLAN_MISSING] "
-                    f"path={VLLM_STARTUP_PLAN_CACHE}",
-                    flush=True,
-                )
-        else:
-            self.startup_plan_commit_thread = None
         if RUNTIME_CACHE_SYNC_ENABLED:
             self.cache_sync_thread = _start_runtime_cache_sync(
                 cache_sources,
@@ -956,7 +1056,7 @@ class VllmServer:
             print(
                 "[CACHE_SYNC_SKIP] "
                 "reason=stable_production_cache "
-                "volume_cache=read_only_during_serving "
+                "flashinfer_cache=persist_on_save "
                 "github_backup=cpu_worker",
                 flush=True,
             )
@@ -977,6 +1077,8 @@ class VllmServer:
     @modal.exit()
     def shutdown(self) -> None:
         """容器退出时回收 vLLM 子进程。"""
+        for thread in getattr(self, "flashinfer_cache_commit_threads", []):
+            thread.join(timeout=30)
         startup_plan_commit_thread = getattr(
             self,
             "startup_plan_commit_thread",
