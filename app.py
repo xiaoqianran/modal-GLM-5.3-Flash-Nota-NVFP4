@@ -979,6 +979,17 @@ class VllmServer:
     @modal.exit()
     def shutdown(self) -> None:
         """容器退出时回收 vLLM 子进程。"""
+        startup_plan_commit_thread = getattr(
+            self,
+            "startup_plan_commit_thread",
+            None,
+        )
+        if (
+            startup_plan_commit_thread is not None
+            and startup_plan_commit_thread.is_alive()
+        ):
+            startup_plan_commit_thread.join(timeout=30)
+
         handle = getattr(self, "vllm_handle", None)
         if handle is None:
             return
