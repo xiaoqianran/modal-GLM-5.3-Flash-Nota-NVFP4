@@ -4,22 +4,25 @@ import urllib.error
 import urllib.request
 
 
+WARMUP_REPEATS = 3
+WARMUP_MAX_TOKENS = 16
+
+
 def step_008_run_warmup(
     model: str,
     process_started_at: float,
     api_ready_at: float,
     base_url: str = "http://127.0.0.1:8000",
     timeout_s: float = 300,
-    repeats: int = 3,
-    max_tokens: int = 16,
+    repeats: int = WARMUP_REPEATS,
 ) -> None:
-    """Snapshot 前执行少量真实请求，只用于触发必要的 JIT/CUDA Graph 热身。"""
+    """生产 warmup：固定 16 tokens，只触发必要的 JIT/CUDA Graph 热身。"""
     url = base_url.rstrip("/") + "/v1/chat/completions"
     payload = json.dumps(
         {
             "model": model,
             "messages": [{"role": "user", "content": "Reply with OK."}],
-            "max_tokens": max_tokens,
+            "max_tokens": WARMUP_MAX_TOKENS,
             "temperature": 0,
         }
     ).encode("utf-8")
@@ -33,7 +36,7 @@ def step_008_run_warmup(
         started_at = time.perf_counter()
         print(
             "[008_WARMUP_START] "
-            f"case={index}/{repeats} max_tokens={max_tokens} "
+            f"case={index}/{repeats} max_tokens={WARMUP_MAX_TOKENS} "
             f"after_api_ready_s={started_at - api_ready_at:.3f} "
             f"from_process_start_s={started_at - process_started_at:.3f}",
             flush=True,

@@ -10,7 +10,7 @@ set "MODAL_WORKSPACE="
 for /f "usebackq delims=" %%A in (`uv run modal profile current 2^>nul`) do set "MODAL_WORKSPACE=%%A"
 if not defined MODAL_WORKSPACE goto :profile_error
 
-set "PUBLIC_BASE_URL=https://%MODAL_WORKSPACE%--%APP_NAME%-serve.modal.run"
+set "PUBLIC_BASE_URL=https://%MODAL_WORKSPACE%--%APP_NAME%-vllmserver-serve.modal.run"
 set "OPENAI_BASE_URL=%PUBLIC_BASE_URL%/v1"
 set "MODELS_URL=%OPENAI_BASE_URL%/models"
 set "CHAT_URL=%OPENAI_BASE_URL%/chat/completions"

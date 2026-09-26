@@ -53,8 +53,12 @@ def _read_json(request: urllib.request.Request) -> dict:
 def _path_has_required(root: Path, required_globs: tuple[str, ...]) -> bool:
     if not root.exists():
         return False
+    ignored = {".staged-cache-dirty", ".github-backup-dirty"}
     return any(
-        any(path.is_file() for path in root.glob(pattern))
+        any(
+            path.is_file() and path.name not in ignored
+            for path in root.glob(pattern)
+        )
         for pattern in required_globs
     )
 

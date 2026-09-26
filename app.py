@@ -1,6 +1,10 @@
+import hashlib
 import importlib
 import json
 import os
+import threading
+import time
+import urllib.request
 
 import modal
 
@@ -32,9 +36,6 @@ cache_restore_module = importlib.import_module("helpers.009_cache_restore")
 CacheArtifact = cache_restore_module.CacheArtifact
 cache_fingerprint = cache_restore_module.cache_fingerprint
 step_009_restore_cache = cache_restore_module.step_009_restore_cache
-step_010_publish_cache = importlib.import_module(
-    "helpers.010_cache_publish"
-).step_010_publish_cache
 step_011_discover_runtime_caches = importlib.import_module(
     "helpers.011_cache_discovery"
 ).step_011_discover_runtime_caches
@@ -42,19 +43,28 @@ cache_staging_module = importlib.import_module("helpers.012_cache_staging")
 step_012_stage_cache = cache_staging_module.step_012_stage_cache
 step_012_sync_cache = cache_staging_module.step_012_sync_cache
 step_012_cache_dirty = cache_staging_module.step_012_cache_dirty
-step_012_clear_dirty = cache_staging_module.step_012_clear_dirty
 archive_staging_module = importlib.import_module("helpers.013_stage_archive")
 step_013_stage_archive = archive_staging_module.step_013_stage_archive
 step_013_sync_archive = archive_staging_module.step_013_sync_archive
 step_013_compact_legacy_seed = archive_staging_module.step_013_compact_legacy_seed
+cache_backup_state = importlib.import_module("helpers.015_cache_backup_state")
+mark_cache_backup_dirty = cache_backup_state.mark_cache_backup_dirty
+step_016_prepare_model_mirror = importlib.import_module(
+    "helpers.016_model_mirror"
+).step_016_prepare_model_mirror
+step_017_run_generation_benchmark = importlib.import_module(
+    "helpers.017_generation_benchmark"
+).step_017_run_generation_benchmark
 
 
 APP_NAME = os.getenv("GLM53_APP_NAME", "glm53-flash-nota-b300")
 MODAL_WORKSPACE = os.getenv("GLM53_MODAL_WORKSPACE", "zhiyuqqq")
-PUBLIC_BASE_URL = f"https://{MODAL_WORKSPACE}--{APP_NAME}-serve.modal.run"
+PUBLIC_BASE_URL = f"https://{MODAL_WORKSPACE}--{APP_NAME}-vllmserver-serve.modal.run"
 PUBLIC_OPENAI_BASE_URL = f"{PUBLIC_BASE_URL}/v1"
 MODEL = "nota-ai/GLM-5.3-Flash-Nota-NVFP4"
 REVISION = "c5fc7f5ef0447ab030559bb4b08861a36dbbe847"
+MODEL_RUNTIME_PATH = "/tmp/glm53-model"
+RUNTIME_IMAGE = "vllm/vllm-openai:glm53-flash"
 
 HF_CACHE = "/root/.cache/huggingface"
 HF_VOLUME_NAME = "glm53-flash-nota-hf-cache"
@@ -77,6 +87,8 @@ CUDA_COMPUTE_VOLUME_NAME = "glm53-flash-nota-cuda-compute-cache"
 
 GITHUB_REPO = "xiaoqianran/modal-GLM-5.3-Flash-Nota-NVFP4"
 CACHE_RELEASE_TAG = "cache-b300-glm53-flash-nota-v1"
+CACHE_BACKUP_APP_NAME = "glm53-cache-backup"
+CACHE_BACKUP_FUNCTION_NAME = "backup_runtime_caches"
 RUNTIME_CACHE_ARTIFACTS = (
     CacheArtifact(
         name="flashinfer-autotune",
@@ -121,7 +133,7 @@ STAGED_CACHE_ARTIFACTS = (
         local_path=CUDA_COMPUTE_CACHE_SEED,
         volume_name=CUDA_COMPUTE_VOLUME_NAME,
         release_asset="cuda-compute-b300.tar.gz",
-        required_globs=("**/*",),
+        required_globs=("cuda-compute-b300.tar",),
     ),
 )
 STAGED_CACHE_RUNTIME_PATHS = {
@@ -129,8 +141,15 @@ STAGED_CACHE_RUNTIME_PATHS = {
     "torchinductor": TORCHINDUCTOR_CACHE,
     "cuda-compute": CUDA_COMPUTE_CACHE,
 }
+STAGED_CACHE_ARCHIVE_NAMES = {
+    "triton": ".stage-cache.tar",
+    "torchinductor": ".stage-cache.tar",
+    "cuda-compute": "cuda-compute-b300.tar",
+}
 STAGED_CACHE_NAMES = frozenset(STAGED_CACHE_RUNTIME_PATHS)
-ARCHIVED_STAGED_CACHE_NAMES = frozenset({"triton", "torchinductor"})
+ARCHIVED_STAGED_CACHE_NAMES = frozenset(
+    {"triton", "torchinductor", "cuda-compute"}
+)
 ALL_CACHE_ARTIFACTS = RUNTIME_CACHE_ARTIFACTS + STAGED_CACHE_ARTIFACTS
 
 MAX_B300_CONTAINERS = 1
@@ -147,6 +166,12 @@ CUDAGRAPH_CAPTURE_SIZES = tuple(
 )
 MAX_CUDAGRAPH_CAPTURE_SIZE = CUDAGRAPH_CAPTURE_SIZES[-1]
 SCALEDOWN_WINDOW_SECONDS = 1800
+SNAPSHOT_CPU_MEMORY_MIB = 307200
+SNAPSHOT_STARTUP_TIMEOUT_SECONDS = 1800
+SNAPSHOT_CONTROL_TIMEOUT_SECONDS = 900
+PRODUCTION_SERVING_PROFILE_SHA256 = (
+    "4e2c2ebecbb8b6f96a7827159d99ec7d5ddfdbc81c4b26ddef4bfddc61443fd2"
+)
 
 # 已实测：Modal Volume(9P) 上 prefetch-16 明显优于 default / eager。
 LOAD_STRATEGY = os.getenv("GLM53_LOAD_STRATEGY", "prefetch").strip().lower()
@@ -159,6 +184,47 @@ if PREFETCH_THREADS < 1:
     raise ValueError("GLM53_PREFETCH_THREADS must be >= 1")
 if PREFETCH_BLOCK_MIB < 1:
     raise ValueError("GLM53_PREFETCH_BLOCK_MIB must be >= 1")
+
+
+def _production_serving_profile() -> dict:
+    """冻结已验证的 B300 serving 配置；修改后必须显式更新指纹。"""
+    return {
+        "model": MODEL,
+        "revision": REVISION,
+        "runtime_image": RUNTIME_IMAGE,
+        "gpu": "B300",
+        "tensor_parallel_size": 1,
+        "gpu_memory_utilization": 0.96,
+        "max_num_seqs": MAX_CONCURRENT_INPUTS,
+        "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS,
+        "kv_cache_dtype": "fp8",
+        "mtp_speculative_tokens": MTP_SPECULATIVE_TOKENS,
+        "cudagraph_mode": "FULL_DECODE_ONLY",
+        "cudagraph_capture_sizes": list(CUDAGRAPH_CAPTURE_SIZES),
+        "load_strategy": LOAD_STRATEGY,
+        "prefetch_threads": PREFETCH_THREADS,
+        "prefetch_block_mib": PREFETCH_BLOCK_MIB,
+    }
+
+
+def _validate_production_serving_profile() -> str:
+    """阻止关键参数被无意修改，避免 FlashInfer cache key 静默漂移。"""
+    serialized = json.dumps(
+        _production_serving_profile(),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    actual = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    if actual != PRODUCTION_SERVING_PROFILE_SHA256:
+        raise RuntimeError(
+            "Production serving profile changed. "
+            "This may invalidate FlashInfer/runtime caches. "
+            f"expected={PRODUCTION_SERVING_PROFILE_SHA256} actual={actual}"
+        )
+    return actual
+
+
+PRODUCTION_SERVING_PROFILE_FINGERPRINT = _validate_production_serving_profile()
 
 
 volume = modal.Volume.from_name(HF_VOLUME_NAME, create_if_missing=True)
@@ -197,13 +263,15 @@ cache_image = (
 
 
 runtime_image = (
-    modal.Image.from_registry("vllm/vllm-openai:glm53-flash", add_python="3.12")
+    modal.Image.from_registry(RUNTIME_IMAGE, add_python="3.12")
     .entrypoint([])
     .env(
         {
             "CUDA_VISIBLE_DEVICES": "0",
             "HF_HOME": HF_CACHE,
             "HF_HUB_OFFLINE": "1",
+            "VLLM_SERVER_DEV_MODE": "1",
+            "TORCHINDUCTOR_COMPILE_THREADS": "1",
             "GLM53_LOAD_STRATEGY": LOAD_STRATEGY,
             "GLM53_PREFETCH_THREADS": str(PREFETCH_THREADS),
             "GLM53_PREFETCH_BLOCK_MIB": str(PREFETCH_BLOCK_MIB),
@@ -256,28 +324,27 @@ def _restore_runtime_caches() -> dict[str, str]:
     return _restore_cache_artifacts(ALL_CACHE_ARTIFACTS)
 
 
-def _publish_runtime_caches() -> dict[str, bool]:
-    results: dict[str, bool] = {}
-    for artifact in ALL_CACHE_ARTIFACTS:
-        staged_dirty = (
-            artifact.name in STAGED_CACHE_NAMES
-            and step_012_cache_dirty(artifact.local_path)
+def _spawn_cache_backup() -> None:
+    """把 GitHub 备份交给独立 CPU App；当前 B300 不等待上传完成。"""
+    try:
+        backup_function = modal.Function.from_name(
+            CACHE_BACKUP_APP_NAME,
+            CACHE_BACKUP_FUNCTION_NAME,
         )
-        published = step_010_publish_cache(
-            artifact,
-            github_repo=GITHUB_REPO,
-            release_tag=CACHE_RELEASE_TAG,
-            replace_existing=staged_dirty,
+        backup_function.spawn()
+        print(
+            "[CACHE_BACKUP_SPAWNED] "
+            f"app={CACHE_BACKUP_APP_NAME} "
+            f"function={CACHE_BACKUP_FUNCTION_NAME}",
+            flush=True,
         )
-        results[artifact.name] = published
-        if published and staged_dirty:
-            step_012_clear_dirty(artifact.local_path)
-            cache_volumes[artifact.name].commit()
-            print(
-                f"[012_CACHE_DIRTY_CLEARED] name={artifact.name}",
-                flush=True,
-            )
-    return results
+    except Exception as exc:
+        print(
+            "[CACHE_BACKUP_SPAWN_FAILED] "
+            f"app={CACHE_BACKUP_APP_NAME} "
+            f"error={type(exc).__name__}: {exc}",
+            flush=True,
+        )
 
 
 @app.function(
@@ -295,26 +362,13 @@ def step_009_restore_runtime_caches():
 
 @app.function(
     image=cache_image,
-    cpu=1,
-    memory=2048,
-    timeout=1800,
-    secrets=[github_secret],
-    volumes=cache_mounts,
-)
-def step_010_publish_runtime_caches():
-    """CPU 阶段：确保当前可移植缓存已有 GitHub Release 备份。"""
-    return _publish_runtime_caches()
-
-
-@app.function(
-    image=cache_image,
     cpu=2,
     memory=4096,
     timeout=1800,
     volumes=cache_mounts,
 )
 def step_013_compact_staged_archives():
-    """CPU 一次性迁移：把 Triton/Inductor 多文件 seed 收口为单归档。"""
+    """CPU 一次性迁移：把 Triton/Inductor/CUDA 多文件 seed 收口为单归档。"""
     results: dict[str, bool] = {}
     for artifact in STAGED_CACHE_ARTIFACTS:
         if artifact.name not in ARCHIVED_STAGED_CACHE_NAMES:
@@ -322,6 +376,7 @@ def step_013_compact_staged_archives():
         changed = step_013_compact_legacy_seed(
             artifact.local_path,
             name=artifact.name,
+            archive_name=STAGED_CACHE_ARCHIVE_NAMES[artifact.name],
         )
         results[artifact.name] = changed
         cache_volumes[artifact.name].commit()
@@ -356,75 +411,66 @@ def step_002_bench_weights(
 
 
 @app.function(
-    image=runtime_image,
-    gpu="B300",
-    cpu=8,
-    memory=32768,
-    timeout=1800,
-    scaledown_window=SCALEDOWN_WINDOW_SECONDS,
-    min_containers=0,
-    max_containers=MAX_B300_CONTAINERS,
-    buffer_containers=0,
-    volumes={HF_CACHE: volume, **cache_mounts},
-    secrets=[github_secret],
+    image=cache_image,
+    cpu=1,
+    memory=1024,
+    timeout=2000,
 )
-@modal.concurrent(max_inputs=MAX_CONCURRENT_INPUTS)
-@modal.web_server(8000, startup_timeout=1800)
-def serve():
-    """启动单 B300 vLLM 服务，并在服务就绪后自动发送一次最小 warmup 请求。"""
-    print(
-        f"[PUBLIC_API] base_url={PUBLIC_BASE_URL} openai_base_url={PUBLIC_OPENAI_BASE_URL}",
-        flush=True,
+def step_017_bench_generation():
+    """手动长输出 benchmark；不会参与 VllmServer startup。"""
+    return step_017_run_generation_benchmark(
+        model=MODEL,
+        base_url=PUBLIC_BASE_URL,
     )
-    cache_sources = _restore_cache_artifacts(RUNTIME_CACHE_ARTIFACTS)
-    cache_fingerprints_before = {
-        artifact.name: cache_fingerprint(artifact)
-        for artifact in RUNTIME_CACHE_ARTIFACTS
-    }
+
+
+def _stage_runtime_caches() -> None:
+    """B300 只读取单归档；归档缺失时本地重建，绝不逐文件读取 Volume。"""
     for artifact in STAGED_CACHE_ARTIFACTS:
         runtime_path = STAGED_CACHE_RUNTIME_PATHS[artifact.name]
         if artifact.name in ARCHIVED_STAGED_CACHE_NAMES:
-            archived = step_013_stage_archive(
+            archive_name = STAGED_CACHE_ARCHIVE_NAMES[artifact.name]
+            staged = step_013_stage_archive(
                 artifact.local_path,
                 runtime_path,
                 name=artifact.name,
+                archive_name=archive_name,
             )
-            if not archived:
-                step_012_stage_cache(
-                    artifact.local_path,
-                    runtime_path,
-                    name=artifact.name,
+            if not staged:
+                os.makedirs(runtime_path, exist_ok=True)
+                print(
+                    "[STAGED_CACHE_EMPTY] "
+                    f"name={artifact.name} archive={archive_name} "
+                    "reason=archive_missing action=regenerate_locally",
+                    flush=True,
                 )
-        else:
-            step_012_stage_cache(
-                artifact.local_path,
-                runtime_path,
-                name=artifact.name,
-            )
+            continue
+        step_012_stage_cache(
+            artifact.local_path,
+            runtime_path,
+            name=artifact.name,
+        )
 
+
+def _build_vllm_command(model_path: str) -> list[str]:
+    """用本地 metadata mirror 启动 serving；权重 symlink 仍指向 HF Volume blob。"""
     strategy = os.environ.get(
         "GLM53_LOAD_STRATEGY",
         "prefetch",
     ).strip().lower()
-    prefetch_threads = int(
-        os.environ.get("GLM53_PREFETCH_THREADS", "16")
-    )
-    prefetch_block_mib = int(
-        os.environ.get("GLM53_PREFETCH_BLOCK_MIB", "16")
-    )
+    prefetch_threads = int(os.environ.get("GLM53_PREFETCH_THREADS", "16"))
+    prefetch_block_mib = int(os.environ.get("GLM53_PREFETCH_BLOCK_MIB", "16"))
 
     command = [
         "vllm",
         "serve",
-        MODEL,
+        model_path,
         "--host",
         "0.0.0.0",
         "--port",
         "8000",
         "--served-model-name",
         MODEL,
-        "--revision",
-        REVISION,
         "--tensor-parallel-size",
         "1",
         "--gpu-memory-utilization",
@@ -456,6 +502,7 @@ def serve():
         "--reasoning-parser",
         "glm45",
         "--enable-auto-tool-choice",
+        "--enable-sleep-mode",
     ]
 
     if strategy != "default":
@@ -471,87 +518,249 @@ def serve():
 
     print(
         "[MODEL_LOAD] "
+        f"model_path={model_path} "
         f"strategy={strategy} "
         f"prefetch_threads={prefetch_threads} "
         f"prefetch_block_mib={prefetch_block_mib}",
         flush=True,
     )
+    return command
 
-    # 003~006：保持单一 vLLM 进程，并按阶段旁路观测同一份真实日志。
-    vllm_handle = step_003_start_vllm_with_model_init_observer(
-        command,
-        extra_observer_factories=[
-            step_004_create_kv_cache_observer,
-            step_005_create_kernel_jit_observer,
-            step_006_create_cuda_graph_observer,
-        ],
+
+def _post_vllm_control(path: str, timeout_s: float) -> None:
+    """调用仅用于 snapshot 生命周期的本机 vLLM 控制端点。"""
+    url = f"http://127.0.0.1:8000{path}"
+    started_at = time.perf_counter()
+    request = urllib.request.Request(url, data=b"", method="POST")
+    with urllib.request.urlopen(request, timeout=timeout_s) as response:
+        status = int(response.status)
+        response.read()
+
+    if not 200 <= status < 300:
+        raise RuntimeError(f"vLLM control endpoint failed: {url} -> {status}")
+
+    print(
+        "[SNAPSHOT_CONTROL] "
+        f"path={path} http_status={status} "
+        f"elapsed_s={time.perf_counter() - started_at:.3f}",
+        flush=True,
     )
 
-    def warmup_once(api_ready_at: float) -> None:
-        """008：API Ready 后执行真实 warmup，再固化并发现运行时缓存。"""
-        step_008_run_warmup(
-            model=MODEL,
-            process_started_at=vllm_handle.started_at,
-            api_ready_at=api_ready_at,
+
+def _sync_runtime_caches(
+    cache_sources: dict[str, str],
+    cache_fingerprints_before: dict[str, tuple],
+) -> None:
+    """先把 cache 安全落到 Modal Volume，再异步交给 CPU worker 备份 GitHub。"""
+    for artifact in STAGED_CACHE_ARTIFACTS:
+        runtime_path = STAGED_CACHE_RUNTIME_PATHS[artifact.name]
+        if artifact.name in ARCHIVED_STAGED_CACHE_NAMES:
+            changed = step_013_sync_archive(
+                runtime_path,
+                artifact.local_path,
+                name=artifact.name,
+                archive_name=STAGED_CACHE_ARCHIVE_NAMES[artifact.name],
+            )
+        else:
+            step_012_sync_cache(
+                runtime_path,
+                artifact.local_path,
+                name=artifact.name,
+            )
+            changed = step_012_cache_dirty(artifact.local_path)
+
+        if changed:
+            mark_cache_backup_dirty(artifact.local_path)
+
+        cache_volumes[artifact.name].commit()
+        print(
+            f"[RUNTIME_CACHE_COMMIT] name={artifact.name} path={artifact.local_path}",
+            flush=True,
         )
-        for artifact in STAGED_CACHE_ARTIFACTS:
-            runtime_path = STAGED_CACHE_RUNTIME_PATHS[artifact.name]
-            if artifact.name in ARCHIVED_STAGED_CACHE_NAMES:
-                step_013_sync_archive(
-                    runtime_path,
-                    artifact.local_path,
-                    name=artifact.name,
-                )
-            else:
-                step_012_sync_cache(
-                    runtime_path,
-                    artifact.local_path,
-                    name=artifact.name,
-                )
-            cache_volumes[artifact.name].commit()
+        print(
+            "[CACHE_VOLUME_SAFE] "
+            f"name={artifact.name} changed={str(changed).lower()}",
+            flush=True,
+        )
+
+    for artifact in RUNTIME_CACHE_ARTIFACTS:
+        before = cache_fingerprints_before.get(artifact.name, ())
+        after = cache_fingerprint(artifact)
+        changed = before != after
+
+        if changed:
+            mark_cache_backup_dirty(artifact.local_path)
             print(
-                f"[RUNTIME_CACHE_COMMIT] name={artifact.name} path={artifact.local_path}",
+                f"[RUNTIME_CACHE_CHANGED] name={artifact.name} "
+                f"before_files={len(before)} after_files={len(after)}",
                 flush=True,
             )
 
-        for artifact in RUNTIME_CACHE_ARTIFACTS:
-            cache_volumes[artifact.name].commit()
-            print(
-                f"[RUNTIME_CACHE_COMMIT] name={artifact.name} path={artifact.local_path}",
-                flush=True,
-            )
+        cache_volumes[artifact.name].commit()
+        print(
+            f"[RUNTIME_CACHE_COMMIT] name={artifact.name} path={artifact.local_path}",
+            flush=True,
+        )
+        print(
+            "[CACHE_VOLUME_SAFE] "
+            f"name={artifact.name} changed={str(changed).lower()} "
+            f"source={cache_sources.get(artifact.name, 'unknown')}",
+            flush=True,
+        )
 
-            before = cache_fingerprints_before.get(artifact.name, ())
-            after = cache_fingerprint(artifact)
-            changed = before != after
-            if changed:
-                print(
-                    f"[RUNTIME_CACHE_CHANGED] name={artifact.name} "
-                    f"before_files={len(before)} after_files={len(after)}",
-                    flush=True,
-                )
+    _spawn_cache_backup()
 
-            if not changed and cache_sources.get(artifact.name) != "miss":
-                continue
+
+@app.cls(
+    image=runtime_image,
+    gpu="B300",
+    cpu=8,
+    memory=SNAPSHOT_CPU_MEMORY_MIB,
+    timeout=SNAPSHOT_STARTUP_TIMEOUT_SECONDS,
+    scaledown_window=SCALEDOWN_WINDOW_SECONDS,
+    min_containers=0,
+    max_containers=MAX_B300_CONTAINERS,
+    buffer_containers=0,
+    volumes={HF_CACHE: volume, **cache_mounts},
+    secrets=[github_secret],
+    enable_memory_snapshot=True,
+    experimental_options={"enable_gpu_snapshot": True},
+)
+@modal.concurrent(max_inputs=MAX_CONCURRENT_INPUTS)
+class VllmServer:
+    """单 B300 vLLM；首次完整初始化后创建 CPU+GPU Memory Snapshot。"""
+
+    @modal.enter(snap=True)
+    def startup(self) -> None:
+        """首次构建：初始化、轻量 warmup、sleep，然后由 Modal 保存 snapshot。"""
+        build_started_at = time.perf_counter()
+        print(
+            "[SNAPSHOT_BUILD_START] "
+            f"cpu_memory_mib={SNAPSHOT_CPU_MEMORY_MIB}",
+            flush=True,
+        )
+        print(
+            f"[PUBLIC_API] base_url={PUBLIC_BASE_URL} "
+            f"openai_base_url={PUBLIC_OPENAI_BASE_URL}",
+            flush=True,
+        )
+
+        cache_sources = _restore_cache_artifacts(RUNTIME_CACHE_ARTIFACTS)
+        cache_fingerprints_before = {
+            artifact.name: cache_fingerprint(artifact)
+            for artifact in RUNTIME_CACHE_ARTIFACTS
+        }
+        _stage_runtime_caches()
+        model_path = step_016_prepare_model_mirror(
+            hf_cache=HF_CACHE,
+            model=MODEL,
+            revision=REVISION,
+            destination=MODEL_RUNTIME_PATH,
+        )
+
+        self.vllm_handle = step_003_start_vllm_with_model_init_observer(
+            _build_vllm_command(model_path),
+            extra_observer_factories=[
+                step_004_create_kv_cache_observer,
+                step_005_create_kernel_jit_observer,
+                step_006_create_cuda_graph_observer,
+            ],
+        )
+
+        snapshot_ready = threading.Event()
+        startup_errors: list[BaseException] = []
+
+        def prepare_snapshot(api_ready_at: float) -> None:
             try:
-                step_010_publish_cache(
-                    artifact,
-                    github_repo=GITHUB_REPO,
-                    release_tag=CACHE_RELEASE_TAG,
-                    replace_existing=changed,
+                step_008_run_warmup(
+                    model=MODEL,
+                    process_started_at=self.vllm_handle.started_at,
+                    api_ready_at=api_ready_at,
+                    repeats=3,
                 )
-            except Exception as exc:
+                _post_vllm_control(
+                    "/sleep?level=1",
+                    timeout_s=SNAPSHOT_CONTROL_TIMEOUT_SECONDS,
+                )
+                _sync_runtime_caches(
+                    cache_sources,
+                    cache_fingerprints_before,
+                )
+                step_011_discover_runtime_caches()
                 print(
-                    "[010_CACHE_PUBLISH_FAILED] "
-                    f"name={artifact.name} error={type(exc).__name__}",
+                    "[SNAPSHOT_PREPARED] "
+                    f"elapsed_s={time.perf_counter() - build_started_at:.3f}",
                     flush=True,
                 )
+            except BaseException as exc:
+                startup_errors.append(exc)
+                print(
+                    "[SNAPSHOT_PREPARE_FAILED] "
+                    f"error={type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+            finally:
+                snapshot_ready.set()
 
-        step_011_discover_runtime_caches()
+        step_007_start_api_ready_observer(
+            process=self.vllm_handle.process,
+            process_started_at=self.vllm_handle.started_at,
+            timeout_s=SNAPSHOT_STARTUP_TIMEOUT_SECONDS,
+            on_ready=prepare_snapshot,
+        )
 
-    # 007/008：HTTP 200 确认 API Ready 后，立即执行最小真实 generation。
-    step_007_start_api_ready_observer(
-        process=vllm_handle.process,
-        process_started_at=vllm_handle.started_at,
-        on_ready=warmup_once,
+        if not snapshot_ready.wait(SNAPSHOT_STARTUP_TIMEOUT_SECONDS):
+            raise TimeoutError("Timed out while preparing vLLM memory snapshot")
+        if startup_errors:
+            raise RuntimeError(
+                "vLLM snapshot preparation failed"
+            ) from startup_errors[0]
+
+    @modal.enter(snap=False)
+    def wake_from_snapshot(self) -> None:
+        """新容器：恢复 snapshot 后只把权重/KV 唤醒回 GPU。"""
+        wake_started_at = time.perf_counter()
+        print("[SNAPSHOT_WAKE_START]", flush=True)
+
+        _post_vllm_control(
+            "/wake_up",
+            timeout_s=SNAPSHOT_CONTROL_TIMEOUT_SECONDS,
+        )
+        ready_event = step_007_start_api_ready_observer(
+            process=self.vllm_handle.process,
+            process_started_at=wake_started_at,
+            timeout_s=SNAPSHOT_CONTROL_TIMEOUT_SECONDS,
+        )
+        if not ready_event.wait(SNAPSHOT_CONTROL_TIMEOUT_SECONDS):
+            raise TimeoutError("vLLM did not become ready after snapshot wake_up")
+
+        print(
+            "[SNAPSHOT_WAKE_DONE] "
+            f"elapsed_s={time.perf_counter() - wake_started_at:.3f}",
+            flush=True,
+        )
+
+    @modal.web_server(
+        8000,
+        startup_timeout=SNAPSHOT_STARTUP_TIMEOUT_SECONDS,
     )
+    def serve(self) -> None:
+        """暴露已经初始化并唤醒的 vLLM OpenAI-compatible server。"""
+        pass
+
+    @modal.exit()
+    def shutdown(self) -> None:
+        """容器退出时回收 vLLM 子进程。"""
+        handle = getattr(self, "vllm_handle", None)
+        if handle is None:
+            return
+
+        process = handle.process
+        if process.poll() is not None:
+            return
+
+        process.terminate()
+        try:
+            process.wait(timeout=30)
+        except Exception:
+            process.kill()
