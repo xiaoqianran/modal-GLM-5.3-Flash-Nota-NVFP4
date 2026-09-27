@@ -89,6 +89,13 @@ EngineCore、模型加载、权重加载的边界。
 
 ## startup plan 与 JIT 恢复
 
+2026-09-27 12:24 的首轮 B300 实测发现：已有 startup plan 因 `current_free_memory < baseline`
+的严格字节级比较被拒绝，但日志四舍五入后两者均为 `267.08 GiB`。因此镜像补丁保留原有
+free-memory 安全门，同时允许默认 **256 MiB** 的启动抖动（可通过
+`GLM53_STARTUP_PLAN_FREE_MEMORY_TOLERANCE_MIB` 调整，代码硬上限 1024 MiB）。只有 deficit
+超过容差才回退 full profiling；容差内仍使用原 plan，并记录实际 deficit。这样没有把
+co-tenant / 显存泄漏 / 大幅可用显存下降的保护删除。
+
 plan 提交判断已从“启动前目录有没有文件”改为“有效 plan 的 fingerprint/内容是否
 新增或改变”。仅 mtime/JSON 排版变化不会提交；损坏、临时文件、filename 与
 fingerprint 不一致、无效 KV 大小不会被当作有效 plan。新 plan 或 modelinfos

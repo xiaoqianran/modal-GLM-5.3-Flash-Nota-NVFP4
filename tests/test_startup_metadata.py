@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 
 metadata = importlib.import_module("helpers.018_startup_acceleration")
 restore = importlib.import_module("helpers.009_cache_restore")
+observability = importlib.import_module("helpers.021_patch_startup_observability")
 
 
 class TemporaryFiles(unittest.TestCase):
@@ -28,6 +29,22 @@ class TemporaryFiles(unittest.TestCase):
 
 
 class PlanTests(TemporaryFiles):
+    def test_startup_plan_tolerance_patch_keeps_bounded_safety_gate(self):
+        source = '''import os\n\ndef gate(current_free_memory, baseline):\n    kv_bytes = 123\n    if current_free_memory < baseline:\n        logger.info(\n            "Startup plan not applied: current free memory (%.2f GiB) is "\n            "below the recorded baseline (%.2f GiB); falling back to full "\n            "memory profiling.",\n            current_free_memory / (1 << 30),\n            baseline / (1 << 30),\n        )\n        return None\n    return kv_bytes\n'''
+        patched = observability.patch_startup_plan_tolerance(source)
+        self.assertIn("deficit > tolerance_bytes", patched)
+        self.assertIn("tolerance_mib = min(max(tolerance_mib, 0), 1024)", patched)
+        self.assertIn("Startup plan free-memory jitter accepted", patched)
+        self.assertNotIn("if current_free_memory < baseline:", patched)
+        namespace = {"logger": Mock()}
+        exec(patched, namespace)
+        gib = 1 << 30
+        mib = 1 << 20
+        baseline = 267 * gib
+        with patch.dict(os.environ, {observability.STARTUP_PLAN_TOLERANCE_ENV: "256"}):
+            self.assertEqual(namespace["gate"](baseline - 128 * mib, baseline), 123)
+            self.assertIsNone(namespace["gate"](baseline - 300 * mib, baseline))
+
     def test_old_plan_does_not_hide_new_configuration(self):
         self.write_plan()
         before = metadata.startup_plan_fingerprints(str(self.root))

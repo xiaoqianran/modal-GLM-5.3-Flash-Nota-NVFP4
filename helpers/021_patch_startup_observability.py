@@ -12,6 +12,9 @@ from pathlib import Path
 SITE_PACKAGES = Path("/usr/local/lib/python3.12/dist-packages")
 CAPABILITIES = Path("/root/glm53-startup-capabilities.json")
 TRACE_IMPORT = "from helpers import startup_trace as _glm53_trace"
+STARTUP_PLAN_TOLERANCE_ENV = "GLM53_STARTUP_PLAN_FREE_MEMORY_TOLERANCE_MIB"
+STARTUP_PLAN_TOLERANCE_DEFAULT_MIB = 256
+STARTUP_PLAN_TOLERANCE_MAX_MIB = 1024
 
 
 def _function(tree, owner: str | None, name: str):
@@ -55,6 +58,13 @@ def _add_import(text: str) -> str:
     return "".join(lines)
 
 
+def patch_startup_plan_tolerance(text: str) -> str:
+    """Allow small allocator jitter without removing vLLM's OOM safety gate."""
+    old = '''    if current_free_memory < baseline:\n        logger.info(\n            "Startup plan not applied: current free memory (%.2f GiB) is "\n            "below the recorded baseline (%.2f GiB); falling back to full "\n            "memory profiling.",\n            current_free_memory / (1 << 30),\n            baseline / (1 << 30),\n        )\n        return None\n    return kv_bytes\n'''
+    new = f'''    try:\n        tolerance_mib = int(os.getenv(\n            "{STARTUP_PLAN_TOLERANCE_ENV}",\n            "{STARTUP_PLAN_TOLERANCE_DEFAULT_MIB}",\n        ))\n    except ValueError:\n        tolerance_mib = {STARTUP_PLAN_TOLERANCE_DEFAULT_MIB}\n    tolerance_mib = min(max(tolerance_mib, 0), {STARTUP_PLAN_TOLERANCE_MAX_MIB})\n    tolerance_bytes = tolerance_mib * (1 << 20)\n    deficit = baseline - current_free_memory\n    if deficit > tolerance_bytes:\n        logger.info(\n            "Startup plan not applied: current free memory (%.2f GiB) is "\n            "below the recorded baseline (%.2f GiB) by %.1f MiB, exceeding "\n            "the %d MiB tolerance; falling back to full memory profiling.",\n            current_free_memory / (1 << 30),\n            baseline / (1 << 30),\n            deficit / (1 << 20),\n            tolerance_mib,\n        )\n        return None\n    if deficit > 0:\n        logger.info(\n            "Startup plan free-memory jitter accepted: current %.2f GiB, "\n            "recorded baseline %.2f GiB, deficit %.1f MiB within %d MiB "\n            "tolerance.",\n            current_free_memory / (1 << 30),\n            baseline / (1 << 30),\n            deficit / (1 << 20),\n            tolerance_mib,\n        )\n    return kv_bytes\n'''
+    return _replace_once(text, old, new)
+
+
 def patch_sources(root: Path, versions: dict[str, str]) -> dict:
     paths = {
         "registry": root / "model_executor/models/registry.py",
@@ -81,6 +91,10 @@ def patch_sources(root: Path, versions: dict[str, str]) -> dict:
                    "Saved startup plan to %s", "current_free_memory < baseline"):
         if marker not in plan:
             raise RuntimeError(f"Unverified startup plan contract: {marker}")
+    plan = patch_startup_plan_tolerance(plan)
+    compile(plan, str(paths["plan"]), "exec")
+    paths["plan"].write_text(plan, encoding="utf-8")
+    source["plan"] = plan
     # Removing timing decorations gives stable identities on repeated patch runs.
     identity = {"versions": versions, "plan_schema": 1}
     info_class = next(n for n in ast.parse(registry).body
@@ -133,7 +147,10 @@ def patch_sources(root: Path, versions: dict[str, str]) -> dict:
         compile(text, str(paths[key]), "exec")
         paths[key].write_text(text, encoding="utf-8")
     return {"modelinfo_cache_dir": "modelinfos", "cache_namespace": namespace,
-            "startup_plan_schema": 1, "versions": versions,
+            "startup_plan_schema": 1,
+            "startup_plan_free_memory_tolerance_default_mib": STARTUP_PLAN_TOLERANCE_DEFAULT_MIB,
+            "startup_plan_free_memory_tolerance_max_mib": STARTUP_PLAN_TOLERANCE_MAX_MIB,
+            "versions": versions,
             "source_sha256": {k: hashlib.sha256(p.read_bytes()).hexdigest() for k, p in paths.items()}}
 
 
