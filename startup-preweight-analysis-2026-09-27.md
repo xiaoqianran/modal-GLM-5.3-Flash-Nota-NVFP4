@@ -118,5 +118,300 @@ optional JIT 的记录是 absent/unknown 时不发 GitHub 请求。
 
 本地回归覆盖跨进程非阻塞预读、失败重试、旧 plan 下新增配置、同一 plan 内容
 变化、实际 apply/reject、modelinfos 本地暂存与增量同步、JIT 负缓存与灾备刷新。
-24 项本地测试通过；已构建实际镜像并运行 CPU 能力检查及 CLI 冒烟。真实 B300 的各 span 耗时、modelinfos 二次
-启动命中和整体提速仍需新容器验证，未将源码推断当作性能实测。
+25 项本地测试通过；已构建实际镜像并运行 CPU 能力检查及 CLI 冒烟。后续真实 B300
+结果见下方“完整优化过程与实测结果”；旧的“仍待验证”结论已经关闭。
+
+---
+
+## 完整启动优化过程与实测结果
+
+这一节按时间记录从最初分钟级 cold start 到当前 122 秒级基线的全过程。更早的 A/B/C/D
+原始 benchmark 细节仍保留在 `startup-benchmark-2026-09-26.md`；这里记录的是最终决策、
+为什么改、改完实际发生了什么。
+
+### 1. 最早基线：启动不是单一“权重慢”
+
+2026-09-26 A 组完整 cold start：
+
+| 指标 | 实测 |
+|---|---:|
+| 191.01 GiB / 386 shard 首段 prefetch | 114.85 s |
+| 第一段 Loading weights | 132.87 s |
+| Model loading 总计 | 162.53 s |
+| JIT kernel warmup | 5.06 s |
+| FlashInfer autotune | 256.85 s |
+| CUDA Graph capture | 158 s |
+| engine profile/create KV/warmup | 571.72 s |
+| vLLM process → API Ready | **829.884 s** |
+
+结论从一开始就不是“只优化 191 GiB 权重”，而是同时存在 I/O、autotune、CUDA Graph、
+模型初始化和 API 前置初始化等多个串行阶段。
+
+### 2. 权重读取：确定 prefetch-16，而不是盲目加线程
+
+独立权重实验显示：
+
+| 策略 | 场景 | 代表结果 |
+|---|---|---:|
+| default | 原始偏冷启动 | 405.65 s |
+| prefetch-16 | 完整 vLLM | 47.80 s |
+| prefetch-16 | 独立 deployed 读取 | 43.208 s |
+| prefetch-32 | 后端较热的新容器 | 12.259 s |
+| eager | 后端较热的新容器 | 76.992 s |
+
+32 线程没有稳定优于 16；计划内同条件测试甚至出现 16 线程 7.695 s、32 线程 13.221 s。
+因此生产固定 `prefetch-16 + 16 MiB block`，不继续把线程数当作主要优化变量。
+
+### 3. FlashInfer autotune：从 256~286 秒降到约 2 秒级
+
+最初 FlashInfer autotune 每个新容器重新运行，典型为 256.847~286.193 s。随后把
+autotune config 放到独立持久目录，并在生成后显式 commit 到 Modal Volume；GitHub Release
+只做 portable fallback。C2/D 组新容器确认 `previous configs` 命中后，同一 cache key 的
+autotune 降到约 2 秒级。
+
+这一步把冷启动从 829.884 s 量级压到 D2 的 **149.504 s**，也是迄今收益最大的单项缓存
+优化之一。
+
+### 4. 生产 warmup 与 benchmark 解耦
+
+旧生产路径曾在 API Ready 后自动跑长输出 benchmark（两道题、`max_tokens=8092`），会让
+真实首请求与 benchmark 抢 B300。现在生产启动只保留 `16 tokens × 3` 的短 warmup；8092-token
+题移动到独立 `step_017_bench_generation`，只有显式 benchmark 才运行。
+
+这项不直接改变 `API Ready` 时间，但消除了“API 已 ready、GPU 却仍被内部 benchmark 占用”
+的生产假就绪。
+
+### 5. runtime cache：Modal Volume 主存储，GitHub Release 只做异步 fallback
+
+当前稳定层级：
+
+```text
+HF weights / FlashInfer / TileLang / Triton / TorchInductor / CUDA Compute
+        ↓
+Modal Volume（生产 authoritative cache）
+        ↓
+GitHub Release（CPU worker 异步 portable fallback）
+```
+
+GPU 启动不等待 GitHub backup。CPU backup worker 使用 single-use container；每小时 dirty-check
+全部 clean 时立即退出，不保持 idle 容器。FlashInfer JIT 尚无有效 `.so/.o/.cubin` 时记录
+absent/unknown，普通 GPU 启动不会反复远程查询。
+
+### 6. GPU Memory Snapshot / sleep mode：历史验证有效，但当前生产路径主动移除
+
+历史版本曾实测 snapshot restore → API Ready 约 **5.5 s**，但 snapshot build 与 autotune
+耦合、失败重试及 B300 生命周期管理带来了高复杂度和重复占卡风险。2026-09-27 起生产路径
+明确移除：
+
+```text
+enable_memory_snapshot
+enable_gpu_snapshot
+/sleep?level=1
+/wake_up
+```
+
+并确保 vLLM `enable_sleep_mode=False`。当前优化目标是在**普通新容器初始化路径**本身做到稳定、
+可复现、可分析，而不是依赖 snapshot 命中。Modal 官方现在仍支持 GPU memory snapshot，且
+vLLM 官方示例路线通常要求 sleep mode；这是未来独立实验，不混回当前生产基线。
+
+### 7. 82 秒 pre-weight 黑盒：先测量，再优化
+
+历史新容器里从 vLLM process start 到 weight load start 约 **82.044 s**。新增统一
+`[STARTUP_TRACE]` 后拆出：CLI import、registry inspect/cache/subprocess、EngineCore spawn、
+worker init 等边界，不再把 82 秒当作一个整体猜 CPU 或 I/O。
+
+同时确认实际 console script 使用 `/usr/bin/python3`；Modal 添加的 `/usr/local/bin/python3`
+site-packages 不同，不能作为 vLLM runtime interpreter。
+
+### 8. early weight prefetch：只保留一个 prefetch，并提前到进程 0 秒
+
+曾出现高风险结构：自定义 16-thread reader 与 vLLM 自己的 `prefetch-16` 同时读同一批
+386 shards，可能形成双重 I/O。最终结构改成：
+
+```text
+/usr/bin/python3
+  → 020_vllm_bootstrap
+      ├─ 唯一 early prefetch 立即启动
+      └─ Python / vLLM / registry / EngineCore 初始化并行继续
+
+vLLM loader 到达原生 prefetch 点
+  → 复用同一个 state
+  → 不再启动第二个 reader
+```
+
+2026-09-27 12:21 首轮真实 B300：
+
+```text
+EARLY_WEIGHT_PREFETCH_REQUEST  0.248 s
+WEIGHT_PREFETCH_DONE          12.156 s
+weight_load_start             87.502 s
+WEIGHT_PREFETCH_REUSE         state=done
+```
+
+即 191 GiB page-cache prefetch 完全隐藏在前置初始化里，没有制造新的串行 barrier。
+
+### 9. 第一轮新架构实测：151.779 秒，暴露 registry 与 startup plan 两个问题
+
+容器 `ta-01M3GHHN3D3KRCKMRNE0QVR88R`：
+
+| 阶段 | 实测 |
+|---|---:|
+| API banner | 31.389 s |
+| main architecture | 49.652 s |
+| MTP architecture | 69.272 s |
+| Engine init milestone | 83.098 s |
+| weight load start | 87.502 s |
+| main Loading weights | 24.71 s |
+| MTP/secondary Loading weights | 4.21 s |
+| model init total | 33.28 s |
+| API Ready | **151.779 s** |
+
+这一轮两个 registry cache 都 miss：
+
+```text
+main registry_subprocess = 17.994 s
+MTP  registry_subprocess = 14.793 s
+合计                    ≈ 32.787 s
+```
+
+API Ready 后生成并持久化 2 个 `modelinfos`。同时已有 startup plan 因严格字节级
+`current_free_memory < baseline` 被拒绝，日志四舍五入后两边却都显示 `267.08 GiB`。
+
+### 10. modelinfos 持久化 + startup-plan 有界显存容差
+
+`modelinfos` 只暂存 vLLM 原生模型架构检查缓存，按 vLLM/Torch/Transformers/FlashInfer、
+`_ModelInfo` schema 和 registry contract namespace 隔离；原生 model source hash 仍是最后
+有效性检查，不把整个 `VLLM_CACHE_ROOT` 绑到 Volume。
+
+startup plan 保留 free-memory OOM 安全门，但把“1 byte 少了就拒绝”改成默认 256 MiB 有界
+抖动容差，代码硬上限 1024 MiB。超过容差仍 full profile；没有删除安全检查。
+
+对应提交：
+
+```text
+0b1c9f1 optimize vllm weight prefetch coordination
+a5eb1df optimize startup prefetch and cache persistence
+1b02762 fix startup plan free memory tolerance
+```
+
+### 11. 第二轮新容器：两个 cache 与 startup plan 全部真实命中
+
+容器 `ta-01M3GJGWGXBCY0RXEM6B6YGSMR`：
+
+```text
+[018_MODELINFO_STAGE] files=2
+Glm5NextForConditionalGeneration registry_cache_lookup actual_hit=true
+Glm5NextMTP                      registry_cache_lookup actual_hit=true
+[018_STARTUP_PLAN_APPLIED] actual_hit=true fingerprint=da9a883c7383e0c8
+Applying persisted startup plan ... Memory profiling will be skipped.
+```
+
+关键结果：
+
+| 指标 | 第一轮 | 第二轮 | 改善 |
+|---|---:|---:|---:|
+| main architecture | 18.263 s 区间 | 0.102 s 区间 | 大幅下降 |
+| MTP architecture | 19.620 s 区间 | 8.044 s 区间 | 明显下降 |
+| weight_load_start | 87.502 s | **58.361 s** | -29.141 s |
+| API Ready | 151.779 s | **122.302 s** | **-29.477 s / -19.4%** |
+| Runtime Ready | 157.573 s | **126.606 s** | -30.967 s |
+
+early prefetch 本轮 11.704 s 完成，仍在 weight loader 到达前约 46 秒完成；两次 loader 均
+`WEIGHT_PREFETCH_REUSE state=done`。因此 prefetch 已不再是当前需要继续改的部分。
+
+### 12. 122.302 秒基线剩余瓶颈
+
+第二轮新容器已把瓶颈重新暴露为：
+
+```text
+vllm CLI / Python imports                  ≈ 30.64 s
+main+MTP weights / model finalize          ≈ 34.63 s
+engine startup / KV / warmup / graph       ≈ 26.69 s
+其它 API finalization                      ≈ 数秒
+```
+
+其中 `init engine (profile, create kv cache, warmup model)` 仍为 **25.55 s**，但 startup plan
+已经命中；说明这 25.55 秒不能再叫“memory profiling”。实际日志进一步拆出：
+
+```text
+12:40:18 startup plan apply
+12:40:20 encoder cache: 32242-token budget，profile 1 个最大 video item
+12:40:21 CUTLASS/FlashAttention 首次路径
+12:40:29 Fused-MoE 初始化
+12:40:31 KV cache ready
+12:40:31 JIT kernel warmup（0.07 s）
+12:40:32~33 FlashInfer autotune cache-hit（63/63，约 1.5 s）
+12:40:39~43 CUDA Graph capture（日志报告 6 s）
+12:40:44 engine init done（25.55 s）
+```
+
+因此当前 warmup 最大异常点不是 JIT warmup，而是**文本服务仍在初始化并 profile multimodal
+encoder/video 路径**，其次才是 CUDA Graph capture。
+
+## 当前进行中的下一阶段优化（尚待新 B300 验证）
+
+### A. import：serve-only 路线已实测否决
+
+曾尝试跳过 generic CLI 中的 benchmark / collect_env / launch / run_batch 等模块，直接构建
+`ServeSubcommand`。热容器里 parser 路径一度看到 `11.961 s → 9.909 s`，但这不是 cold start。
+
+随后在两个全新 Modal CPU 容器、相同镜像和 production argv 下重新 A/B：
+
+```text
+serve-only import + parser: 31.572 s + 0.301 s
+generic CLI:                0.004 s + 22.587 s
+```
+
+因此 serve-only 在真正的新容器里**反而更慢约 9 秒**。该代码已撤回，生产继续使用 vLLM
+原生 generic CLI。这个实验也说明不能用热容器 import 数字替代冷启动结论。
+
+### B. import：镜像构建时预编译被 patch 的 vLLM 源文件
+
+`021_patch_startup_observability.py` 会在 image build 修改 registry、startup plan、engine、
+worker、model runner、CLI 源文件。修改源码会使原 `.pyc` 失效。现在 patch 完成后立即对这些
+**确切文件**执行 `py_compile`，把 source→bytecode 编译成本从新容器首次 import 移到一次性
+image build。它不改变运行语义，只减少可避免的首次解释器工作。
+
+同一个 CPU smoke harness 下已有初步 A/B：
+
+```text
+预编译前 cli_command_imports = 28.037 s
+预编译后 cli_command_imports = 22.587 s
+初步减少                    =  5.450 s
+```
+
+这是比 serve-only 更可信的方向，因为没有改 CLI 语义；不过 CPU 容器与 B300 的文件/CPU 环境
+并不完全相同，最终收益仍以新 B300 的 `vllm_cli_import + cli_command_imports` 为准。
+
+### C. warmup：必须保留多模态，不能用 `--language-model-only`
+
+当前模型 config 明确包含 `vision_config`、image/video token，并且本部署需要保留多模态能力。
+因此曾提出的 `--language-model-only` 优化已经**撤回，不进入生产**。
+
+这意味着日志中的 encoder cache / 最大 video item profile 不能简单删除。后续 warmup 优化必须
+在**完整保留图片/视频能力**的前提下进行，例如优化缓存、编译产物、profile 复用或初始化顺序，
+不能通过裁掉 multimodal tower 来换冷启动时间。
+
+### D. 新增 warmup 细粒度 trace
+
+下一轮会额外记录：
+
+```text
+determine_available_memory
+initialize_from_config
+compile_or_warm_up_model
+model_profile_run
+model_capture
+```
+
+这样可以直接回答 25.55 秒里完整多模态路径分别花在多少 KV 初始化、encoder profile、
+kernel warmup 和 CUDA Graph，
+再决定是否值得调整 capture sizes。当前没有为了省 4~6 秒而减少 CUDA Graph shapes，因为这
+可能损失稳态 decode 性能，与“稳态 token/s 优先”的目标冲突。
+
+### E. 暂不默认改 multiprocessing
+
+EngineCore `spawn_to_entry_s` 本轮约 11.176 s。vLLM 支持 `fork/forkserver`，理论上可能利用
+父进程已导入的模块减少第二次解释器启动；但 CLI 默认 `spawn` 是为了 CUDA/线程兼容安全。
+当前不把这类高风险变化设成生产默认。先验证 `.pyc` 与新增 warmup trace，再根据下一轮数据
+继续优化完整多模态路径，并决定是否单独做 forkserver 实验。

@@ -219,6 +219,7 @@ class TraceTests(unittest.TestCase):
         import app
         command = app._build_vllm_command("/tmp/model")
         self.assertEqual(command[:3], ["/usr/bin/python3", "-m", "helpers.020_vllm_bootstrap"])
+        self.assertNotIn("--language-model-only", command)
 
 
 if __name__ == "__main__":

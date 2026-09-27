@@ -5,6 +5,7 @@ import ast
 import hashlib
 import importlib.metadata
 import json
+import py_compile
 import sys
 from pathlib import Path
 
@@ -72,6 +73,7 @@ def patch_sources(root: Path, versions: dict[str, str]) -> dict:
         "engine": root / "v1/engine/core.py",
         "process": root / "v1/engine/utils.py",
         "worker": root / "v1/worker/gpu_worker.py",
+        "model_runner": root / "v1/worker/gpu_model_runner.py",
         "cli": root / "entrypoints/cli/main.py",
     }
     source = {key: path.read_text(encoding="utf-8") for key, path in paths.items()}
@@ -114,8 +116,15 @@ def patch_sources(root: Path, versions: dict[str, str]) -> dict:
         "engine": [("EngineCoreProc", "run_engine_core", "engine_entry"),
                    ("EngineCore", "__init__", "engine_init")],
         "worker": [("Worker", "init_device", "worker_init_device")],
+        "model_runner": [("GPUModelRunner", "profile_run", "model_profile_run"),
+                         ("GPUModelRunner", "capture_model", "model_capture")],
     }
-    for key in ("registry", "engine", "worker", "process", "cli"):
+    targets["worker"] += [
+        ("Worker", "determine_available_memory", "determine_available_memory"),
+        ("Worker", "initialize_from_config", "initialize_from_config"),
+        ("Worker", "compile_or_warm_up_model", "compile_or_warm_up_model"),
+    ]
+    for key in ("registry", "engine", "worker", "model_runner", "process", "cli"):
         text = source[key]
         if TRACE_IMPORT in text:
             continue
@@ -146,10 +155,16 @@ def patch_sources(root: Path, versions: dict[str, str]) -> dict:
         text = _add_import(text)
         compile(text, str(paths[key]), "exec")
         paths[key].write_text(text, encoding="utf-8")
+    # The patch above changes mtimes/content of several large vLLM modules.
+    # Precompile those exact files into the image so every new container does
+    # not pay source->bytecode compilation again on first import.
+    for path in paths.values():
+        py_compile.compile(str(path), doraise=True)
     return {"modelinfo_cache_dir": "modelinfos", "cache_namespace": namespace,
             "startup_plan_schema": 1,
             "startup_plan_free_memory_tolerance_default_mib": STARTUP_PLAN_TOLERANCE_DEFAULT_MIB,
             "startup_plan_free_memory_tolerance_max_mib": STARTUP_PLAN_TOLERANCE_MAX_MIB,
+            "patched_sources_precompiled": True,
             "versions": versions,
             "source_sha256": {k: hashlib.sha256(p.read_bytes()).hexdigest() for k, p in paths.items()}}
 

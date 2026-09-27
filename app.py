@@ -355,15 +355,19 @@ def inspect_startup_runtime(smoke_test: bool = False):
         check=True,
     )
     if smoke_test:
+        production_argv = ["vllm", *_build_vllm_command("/tmp/glm53-model")[3:], "--help"]
+        smoke_code = (
+            "import runpy, sys; import vllm.platforms; "
+            "from vllm.platforms.cpu import CpuPlatform; "
+            "vllm.platforms.current_platform = CpuPlatform(); "
+            f"sys.argv = {production_argv!r}; "
+            "runpy.run_module('helpers.020_vllm_bootstrap', run_name='__main__')"
+        )
         result = subprocess.run(
-            [VLLM_RUNTIME_PYTHON, "-c",
-             # CUDA image cannot infer a device in this CPU-only function.
-             # Set CPU platform only for the diagnostic --help subprocess.
-             "import runpy, sys; import vllm.platforms; "
-             "from vllm.platforms.cpu import CpuPlatform; "
-             "vllm.platforms.current_platform = CpuPlatform(); "
-             "sys.argv = ['vllm', 'serve', '/tmp/glm53-model', '--help']; "
-             "runpy.run_module('helpers.020_vllm_bootstrap', run_name='__main__')"],
+            # CUDA image cannot infer a device in this CPU-only function.
+            # Set CPU platform only for the diagnostic --help subprocess, but
+            # parse the exact production serving argv (including new flags).
+            [VLLM_RUNTIME_PYTHON, "-c", smoke_code],
             capture_output=True, text=True, timeout=180,
         )
         for line in result.stdout.splitlines():
